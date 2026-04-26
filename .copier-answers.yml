@@ -1,0 +1,19 @@
+# Do not edit - changes here will be overwritten by Copier
+_commit: v1
+_src_path: gh:pydev-guide/pyrepo-copier
+author_email: kevin.yamauchi@gmail.com
+author_name: Kevin Yamauchi
+git_versioning: true
+github_username: kevinyamauchi
+minimum_python: 11
+mode: customize
+module_name: oz_viewer
+project_license: BSD-3-Clause
+project_name: oz-viewer
+project_short_description: A viewer for ome-zarr images.
+test_lowest_pinned_dependencies: false
+test_pre_release: true
+use_mypy: false
+use_pre_commit: true
+use_ruff: true
+
