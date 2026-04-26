@@ -34,7 +34,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 # add your package dependencies here
-dependencies = []
+dependencies = [
+    "yaozarrs[io] >= 0.3",
+    "typer >= 0.12",
+    "rich >= 13",
+    "numpy >= 1.24",
+]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # add dependencies for "extra" features here.  Not dev dependencies.
@@ -47,9 +52,8 @@ repository = "https://github.com/kevinyamauchi/oz-viewer"
 
 # Entry points
 # https://peps.python.org/pep-0621/#entry-points
-# same as console_scripts entry point
-# [project.scripts]
-# oz-viewer-cli = "oz_viewer:main_cli"
+[project.scripts]
+oz-viewer = "oz_viewer._cli:app"
 
 # [project.entry-points."some.group"]
 # tomatoes = "oz_viewer:main_tomatoes"
@@ -57,7 +61,7 @@ repository = "https://github.com/kevinyamauchi/oz-viewer"
 # https://peps.python.org/pep-0735/
 # setup with `uv sync` or `pip install -e . --group dev`
 [dependency-groups]
-test = ["pytest", "pytest-cov"]
+test = ["pytest", "pytest-cov", "zarr >= 3.1", "ome-zarr"]
 dev = [
     { include-group = "test" },
     "ipython",
@@ -139,3 +143,8 @@ ignore = [
 # https://github.com/crate-ci/typos/blob/master/docs/reference.md
 [tool.typos.default]
 extend-ignore-identifiers-re = []
+
+[tool.typos.default.extend-words]
+# OME (Open Microscopy Environment) is a domain term, not a typo for "SOME"
+OME = "OME"
+ome = "ome"
