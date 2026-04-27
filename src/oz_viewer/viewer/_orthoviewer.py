@@ -13,39 +13,55 @@ import numpy as np
 
 
 def _make_slider_style(color_a: str, color_b: str) -> str:
+    """Return a widget-level QSS string for an axis-identification dims slider.
+
+    All sub-controls are styled so that the Fusion style engine does not
+    override any individual element.  Structural colors (groove, handle,
+    add-page) use ``palette()`` references so they adapt to whatever theme is
+    active.  The ``sub-page`` gradient encodes the axis identity and is
+    intentionally fixed regardless of theme.
+
+    Parameters
+    ----------
+    color_a : str
+        CSS color for the left/start stop of the sub-page gradient.
+    color_b : str
+        CSS color for the right/end stop of the sub-page gradient.
+
+    Returns
+    -------
+    str
+        QSS string suitable for ``widget.setStyleSheet()``.
+    """
     return f"""
 QSlider::groove:horizontal {{
-    border: 1px solid #bbb;
-    background: white;
-    height: 10px;
-    border-radius: 4px;
-}}
-QSlider::handle:horizontal {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #eee, stop:1 #ccc);
-    border: 1px solid #777;
-    width: 13px;
-    margin-top: -7px;
-    margin-bottom: -7px;
-    border-radius: 4px;
-}}
-QSlider::add-page:horizontal {{
-    background: #fff;
-    border: 1px solid #777;
-    height: 10px;
-    border-radius: 4px;
+    height: 6px;
+    background: palette(mid);
+    border-radius: 3px;
 }}
 QSlider::sub-page:horizontal {{
+    height: 6px;
     background: qlineargradient(x1:0, y1:0.2, x2:1, y2:1,
         stop:0 {color_a}, stop:1 {color_b});
-    border: 1px solid #777;
-    height: 10px;
-    border-radius: 4px;
+    border-radius: 3px;
+}}
+QSlider::add-page:horizontal {{
+    height: 6px;
+    background: palette(mid);
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 20px;
+    height: 20px;
+    margin: -7px 0;
+    border-radius: 10px;
+    background: #2a82da;
+    border: 1px solid palette(shadow);
 }}
 QSlider::handle:horizontal:hover {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #fff, stop:1 #ddd);
-    border: 1px solid #444;
-    border-radius: 4px;
+    background: palette(light);
 }}
+QSlider:horizontal {{ min-height: 20px; }}
 QLabel {{ font-size: 12px; }}
 """
 
@@ -1053,7 +1069,7 @@ def _ensure_qt_app():
 # ---------------------------------------------------------------------------
 
 
-def orthoviewer(zarr_uri: str) -> OmeZarrOrthoViewer:
+def orthoviewer(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
     """Open an orthoviewer window without blocking.
 
     Intended for interactive use (Jupyter Lab, IPython). The Qt event loop
@@ -1064,6 +1080,9 @@ def orthoviewer(zarr_uri: str) -> OmeZarrOrthoViewer:
     ----------
     zarr_uri : str
         Path or URI to the OME-Zarr store.
+    theme : str
+        Registered theme name. Defaults to ``"dark"``.
+        Use ``oz_viewer.theme.list_themes()`` to see available themes.
 
     Returns
     -------
@@ -1077,7 +1096,7 @@ def orthoviewer(zarr_uri: str) -> OmeZarrOrthoViewer:
             "Use launch_orthoviewer() for scripts, or run inside IPython/Jupyter."
         )
 
-    return _build_and_show(zarr_uri)
+    return _build_and_show(zarr_uri, theme=theme)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,14 +1133,14 @@ def _asyncio_exception_handler(context: dict) -> None:
         traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
-async def _run_orthoviewer_async(zarr_uri: str) -> None:
+async def _run_orthoviewer_async(zarr_uri: str, theme: str = "dark") -> None:
     import asyncio as _asyncio
 
     from PySide6.QtWidgets import QApplication
 
     _asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
 
-    viewer = _build_and_show(zarr_uri)
+    viewer = _build_and_show(zarr_uri, theme=theme)
 
     app = QApplication.instance()
     close_event = asyncio.Event()
@@ -1135,7 +1154,7 @@ async def _run_orthoviewer_async(zarr_uri: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def launch_orthoviewer(zarr_uri: str) -> None:
+def launch_orthoviewer(zarr_uri: str, theme: str = "dark") -> None:
     """Open an orthoviewer window and block until it is closed.
 
     Creates a ``QApplication`` if one does not already exist, then runs the
@@ -1146,6 +1165,9 @@ def launch_orthoviewer(zarr_uri: str) -> None:
     ----------
     zarr_uri : str
         Path or URI to the OME-Zarr store.
+    theme : str
+        Registered theme name. Defaults to ``"dark"``.
+        Use ``oz_viewer.theme.list_themes()`` to see available themes.
     """
     import sys
 
@@ -1153,7 +1175,7 @@ def launch_orthoviewer(zarr_uri: str) -> None:
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
-    QtAsyncio.run(_run_orthoviewer_async(zarr_uri), handle_sigint=True)
+    QtAsyncio.run(_run_orthoviewer_async(zarr_uri, theme=theme), handle_sigint=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1161,8 +1183,13 @@ def launch_orthoviewer(zarr_uri: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_and_show(zarr_uri: str) -> OmeZarrOrthoViewer:
+def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
     """Build the full viewer from a zarr URI and show the window."""
+    from PySide6.QtWidgets import QApplication
+
+    from oz_viewer.theme import apply_theme
+
+    apply_theme(QApplication.instance(), theme)
     import yaozarrs
     from cellier.v2.controller import CellierController
     from cellier.v2.gui._scene import QtCanvasWidget, QtDimsSliders

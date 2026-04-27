@@ -140,6 +140,16 @@ def ortho(
             help="Create a synthetic anisotropic OME-Zarr and open it in the viewer.",
         ),
     ] = False,
+    theme: Annotated[
+        str,
+        typer.Option(
+            "--theme",
+            help=(
+                "Theme name to apply. Run 'oz-viewer theme list' to see"
+                " available themes."
+            ),
+        ),
+    ] = "dark",
 ) -> None:
     """Open an OME-Zarr store in the 4-panel orthoviewer."""
     from oz_viewer.viewer import launch_orthoviewer
@@ -166,7 +176,25 @@ def ortho(
             raise typer.Exit(code=1)
         zarr_uri = _resolve_zarr_uri(raw)
 
-    launch_orthoviewer(zarr_uri)
+    launch_orthoviewer(zarr_uri, theme=theme)
+
+
+@app.command(name="theme")
+def theme_cmd(
+    action: Annotated[
+        str,
+        typer.Argument(help="Action to perform. Currently supports: list"),
+    ],
+) -> None:
+    """Manage oz-viewer themes."""
+    if action == "list":
+        from oz_viewer.theme import list_themes
+
+        for name in list_themes():
+            typer.echo(name)
+    else:
+        typer.echo(f"Unknown action {action!r}. Available actions: list", err=True)
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
