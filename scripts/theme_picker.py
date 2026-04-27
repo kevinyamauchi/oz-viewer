@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["cmap", "pydantic", "PySide6"]
+# dependencies = ["cmap", "pydantic", "qtpy", "PySide6"]
 # ///
 """Interactive theme designer for oz-viewer.
 
@@ -88,7 +88,7 @@ class ColorButton:
     """A QPushButton that shows a solid color and opens QColorDialog on click."""
 
     def __init__(self, field_name: str, initial_hex: str, parent=None) -> None:
-        from PySide6.QtWidgets import QPushButton
+        from qtpy.QtWidgets import QPushButton
 
         self.field_name = field_name
         self._hex = initial_hex
@@ -109,8 +109,8 @@ class ColorButton:
         self._btn.setText(self._hex.upper())
 
     def _pick_color(self) -> None:
-        from PySide6.QtGui import QColor
-        from PySide6.QtWidgets import QColorDialog
+        from qtpy.QtGui import QColor
+        from qtpy.QtWidgets import QColorDialog
 
         initial = QColor(self._hex)
         color = QColorDialog.getColor(initial, self._btn, f"Pick {self.field_name}")
@@ -126,7 +126,7 @@ class ColorButton:
 
         Returns
         -------
-        PySide6.QtWidgets.QPushButton
+        qtpy.QtWidgets.QPushButton
             The push-button that displays the color swatch.
         """
         return self._btn
@@ -160,7 +160,7 @@ class ColorButton:
 
 
 def _make_gallery(parent=None):
-    from PySide6.QtWidgets import (
+    from qtpy.QtWidgets import (
         QCheckBox,
         QGroupBox,
         QLabel,
@@ -237,8 +237,8 @@ class ThemePickerWindow:
     """
 
     def __init__(self, initial_theme: Theme, output_path: str | None = None) -> None:
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import (
+        from qtpy.QtCore import Qt
+        from qtpy.QtWidgets import (
             QApplication,
             QComboBox,
             QFormLayout,
@@ -400,7 +400,7 @@ class ThemePickerWindow:
         self._apply_to_app()
 
     def _load_file(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
+        from qtpy.QtWidgets import QFileDialog
 
         path, _ = QFileDialog.getOpenFileName(
             self._win, "Load theme JSON", "", "JSON files (*.json)"
@@ -417,7 +417,7 @@ class ThemePickerWindow:
         self._apply_to_app()
 
     def _save_file(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
+        from qtpy.QtWidgets import QFileDialog
 
         default = self._output_path or f"{self._name}.json"
         path, _ = QFileDialog.getSaveFileName(
@@ -444,7 +444,7 @@ class ThemePickerWindow:
 
         Returns
         -------
-        PySide6.QtWidgets.QMainWindow
+        qtpy.QtWidgets.QMainWindow
             The editor's main window.
         """
         return self._win
@@ -464,7 +464,7 @@ def main() -> None:
     parser.add_argument("--output", metavar="PATH", help="Pre-set the save path")
     args = parser.parse_args()
 
-    from PySide6.QtWidgets import QApplication
+    from qtpy.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
 
