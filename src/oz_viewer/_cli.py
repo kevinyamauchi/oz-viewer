@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -99,6 +100,73 @@ def ping(
         result = run_fetches(chunk_info, n_fetch, timeout, progress, task_id)
 
     print_ping_results(chunk_info, result, console)
+
+
+def _resolve_zarr_uri(path: str) -> str:
+    """Convert a local path to a file:// URI; pass remote URIs through unchanged."""
+    if "://" in path:
+        return path
+    local = Path(path)
+    if not local.exists():
+        typer.echo(f"Error: OME-Zarr store not found at '{local}'", err=True)
+        raise typer.Exit(code=1)
+    return f"file://{local.resolve()}"
+
+
+@app.command()
+def ortho(
+    path: Annotated[
+        str | None,
+        typer.Argument(
+            help="Path or URI to the OME-Zarr store (local path, s3://, gs://, https://).",
+            show_default=False,
+        ),
+    ] = None,
+    path_option: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help=(
+                "Path or URI to the OME-Zarr store"
+                " (alternative to positional argument)."
+            ),
+            show_default=False,
+        ),
+    ] = None,
+    make_example: Annotated[
+        bool,
+        typer.Option(
+            "--make-example",
+            help="Create a synthetic anisotropic OME-Zarr and open it in the viewer.",
+        ),
+    ] = False,
+) -> None:
+    """Open an OME-Zarr store in the 4-panel orthoviewer."""
+    from oz_viewer.viewer import launch_orthoviewer
+
+    if make_example:
+        from oz_viewer.data._blobs import make_example_zarr
+
+        zarr_path = make_example_zarr()
+        zarr_uri = f"file://{zarr_path}"
+    else:
+        raw = path or path_option
+        if raw is None:
+            typer.echo(
+                "Error: provide a path as a positional argument, via --path, "
+                "or use --make-example.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if path is not None and path_option is not None:
+            typer.echo(
+                "Error: provide the path as a positional argument or --path, not both.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        zarr_uri = _resolve_zarr_uri(raw)
+
+    launch_orthoviewer(zarr_uri)
 
 
 if __name__ == "__main__":

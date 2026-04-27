@@ -39,6 +39,8 @@ dependencies = [
     "typer >= 0.12",
     "rich >= 13",
     "numpy >= 1.24",
+    "cellier[pyside]>=0.0.13",
+    "jupyterlab>=4.5.6",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
@@ -148,3 +150,5 @@ extend-ignore-identifiers-re = []
 # OME (Open Microscopy Environment) is a domain term, not a typo for "SOME"
 OME = "OME"
 ome = "ome"
+# lod = Level of Detail (graphics term), not a typo for "load"
+lod = "lod"
