@@ -9,10 +9,12 @@ from rich.panel import Panel
 from rich.pretty import Pretty
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
+    TimeElapsedColumn,
 )
 from rich.table import Table, box
 from rich.theme import Theme
@@ -146,6 +148,48 @@ def make_ping_progress(console: Console) -> Progress:
         BarColumn(),
         TaskProgressColumn(),
         console=console,
+    )
+
+
+def make_download_progress(console: Console) -> Progress:
+    """Return a Rich Progress instance configured for chunk downloading.
+
+    Shows a spinner, a dynamically updated description (used to embed the
+    running MB total), a bar, a keys-completed counter, and elapsed time.
+
+    Parameters
+    ----------
+    console : Console
+        Rich console to bind the progress bar to.
+
+    Returns
+    -------
+    Progress
+        Configured progress bar (not yet started).
+    """
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
+
+
+def print_download_complete(output_dir: object, console: Console) -> None:
+    """Print a green success panel after a completed download.
+
+    Parameters
+    ----------
+    output_dir : path-like
+        Local directory the store was downloaded to.
+    console : Console
+        Rich console to print to.
+    """
+    content = f"[bold green]✓ Download complete[/bold green]\nOutput    {output_dir}"
+    console.print(
+        Panel(content, title="oz-viewer download", border_style="green", expand=False)
     )
 
 

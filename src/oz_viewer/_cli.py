@@ -11,6 +11,7 @@ import typer
 from oz_viewer._display import (
     make_console,
     make_ping_progress,
+    print_download_complete,
     print_error_panel,
     print_metadata_panel,
     print_ping_header,
@@ -195,6 +196,129 @@ def theme_cmd(
     else:
         typer.echo(f"Unknown action {action!r}. Available actions: list", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command()
+def download(
+    url: Annotated[
+        str,
+        typer.Argument(
+            help="Source URL: s3://<bucket>/path/data.zarr or https://host/path/data.zarr"
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Local output directory (default: basename of URL).",
+            show_default=False,
+        ),
+    ] = None,
+    concurrency: Annotated[
+        int,
+        typer.Option(
+            "--concurrency",
+            "-c",
+            help="Maximum concurrent chunk transfers.",
+            min=1,
+        ),
+    ] = 32,
+    no_validate: Annotated[
+        bool,
+        typer.Option(
+            "--no-validate",
+            help="Skip OME-Zarr validation after download.",
+        ),
+    ] = False,
+    anon: Annotated[
+        bool,
+        typer.Option(
+            "--anon/--no-anon",
+            help="Anonymous S3 access (default: --anon).",
+        ),
+    ] = True,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Remove and replace an existing output directory.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help=(
+                "Enumerate keys and probe the first 3, but do not write anything. "
+                "Useful for diagnosing URL or auth issues."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Download an OME-Zarr store from S3 or HTTPS to a local directory."""
+    import asyncio
+    import shutil
+    from urllib.parse import urlparse
+
+    from yaozarrs import validate_zarr_store
+    from yaozarrs._storage import StorageValidationError
+
+    from oz_viewer._download import download as _download
+
+    parsed = urlparse(url.rstrip("/"))
+    scheme = parsed.scheme.lower()
+    if scheme not in ("s3", "https", "http"):
+        typer.echo(
+            f"Error: unsupported URL scheme {scheme!r}. "
+            "Use s3://, https://, or http://.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    default_name = url.rstrip("/").split("/")[-1] or "downloaded.zarr"
+    output_dir: Path = output if output is not None else Path(default_name)
+
+    if output_dir.exists():
+        if overwrite:
+            typer.echo(f"Removing existing {output_dir} ...")
+            shutil.rmtree(output_dir)
+        else:
+            typer.echo(
+                f"Error: {output_dir} already exists. Pass --overwrite to replace it.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    console = make_console()
+
+    try:
+        asyncio.run(_download(url, output_dir, concurrency, anon, dry_run, console))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        typer.echo("\nInterrupted — cleaning up partial output ...", err=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise typer.Exit(code=1) from None
+    except Exception as exc:
+        typer.echo(f"\nFailed: {exc}", err=True)
+        typer.echo("Cleaning up partial output ...", err=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise typer.Exit(code=1) from None
+
+    if dry_run:
+        return
+
+    print_download_complete(output_dir, console)
+
+    if not no_validate:
+        try:
+            validate_zarr_store(str(output_dir))
+            console.print("[bold green]✓ Valid OME-Zarr store.[/bold green]")
+        except StorageValidationError as exc:
+            print_error_panel(str(output_dir), exc, console)
+            raise typer.Exit(code=1) from None
+        except Exception as exc:
+            typer.echo(f"⚠  Validation raised an unexpected error: {exc}", err=True)
 
 
 if __name__ == "__main__":

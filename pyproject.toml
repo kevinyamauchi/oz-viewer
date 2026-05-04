@@ -41,6 +41,11 @@ dependencies = [
     "numpy >= 1.24",
     "cellier[pyside]>=0.0.13",
     "jupyterlab>=4.5.6",
+    # download command
+    "aiohttp >= 3.9",
+    "zarr >= 3.0",
+    "s3fs",
+    "tensorstore",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies

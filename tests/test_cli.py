@@ -106,9 +106,10 @@ def test_ping_default_n_fetch(write_demo_ome):
     assert "5" in result.output
 
 
-def test_ping_timeout(write_demo_ome):
+def test_ping_timeout(write_demo_ome, slow_http_store):
     path = write_demo_ome("image")
-    result = runner.invoke(app, ["ping", str(path), "--timeout", "0"])
+    url = slow_http_store(path)
+    result = runner.invoke(app, ["ping", url, "--timeout", "0", "--n-fetch", "1"])
     assert result.exit_code == 0
     assert "Timeouts" in result.output
 
