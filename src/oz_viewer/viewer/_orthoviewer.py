@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from oz_viewer._perf import StartupPerfTracer
 
 # ---------------------------------------------------------------------------
 # Slider color styles for each 2D panel
@@ -1044,18 +1048,35 @@ def _dtype_decimals(dtype: np.dtype) -> int:
     return 0 if np.issubdtype(dtype, np.integer) else 2
 
 
+def _perf_mark(
+    perf: StartupPerfTracer | None,
+    step: str,
+    /,
+    **fields: object,
+) -> None:
+    if perf is not None:
+        perf.mark(step, **fields)
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: ViewerModel builder
 # ---------------------------------------------------------------------------
 
 
-def build_ortho_viewer_model(zarr_uri: str):
+def build_ortho_viewer_model(
+    zarr_uri: str,
+    *,
+    perf: StartupPerfTracer | None = None,
+):
     """Build a ViewerModel for the orthoviewer without constructing any Qt objects.
 
     Parameters
     ----------
     zarr_uri : str
         Path or URI to the OME-Zarr store.
+    perf : StartupPerfTracer | None, optional
+        Optional startup performance tracer used to record timing milestones
+        while building the viewer model.
 
     Returns
     -------
@@ -1087,7 +1108,9 @@ def build_ortho_viewer_model(zarr_uri: str):
     from rich.console import Console
     from rich.table import Table
 
+    _perf_mark(perf, "viewer.model.start", zarr_uri=zarr_uri)
     data_store = OMEZarrImageDataStore.from_path(zarr_uri)
+    _perf_mark(perf, "viewer.model.data_store_ready", n_levels=data_store.n_levels)
 
     group = yaozarrs.open_group(data_store.zarr_path)
     ome_image = group.ome_metadata()
@@ -1121,6 +1144,7 @@ def build_ortho_viewer_model(zarr_uri: str):
     table.add_row("depth range", f"near={depth_range[0]:.2f}  far={depth_range[1]:.0f}")
 
     Console().print(table)
+    _perf_mark(perf, "viewer.model.metadata_printed")
 
     cs = CoordinateSystem(name="world", axis_labels=("z", "y", "x"))
     voxel_to_world = AffineTransform.from_scale_and_translation(
@@ -1277,6 +1301,7 @@ def build_ortho_viewer_model(zarr_uri: str):
         },
     )
 
+    _perf_mark(perf, "viewer.model.ready", n_scenes=len(viewer_model.scenes))
     return viewer_model
 
 
@@ -1378,14 +1403,21 @@ def _asyncio_exception_handler(context: dict) -> None:
         traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
-async def _run_orthoviewer_async(zarr_uri: str, theme: str = "dark") -> None:
+async def _run_orthoviewer_async(
+    zarr_uri: str,
+    theme: str = "dark",
+    *,
+    perf: StartupPerfTracer | None = None,
+) -> None:
     import asyncio as _asyncio
 
     from PySide6.QtWidgets import QApplication
 
     _asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
+    _perf_mark(perf, "viewer.async.start", theme=theme)
 
-    viewer = _build_and_show(zarr_uri, theme=theme)
+    viewer = _build_and_show(zarr_uri, theme=theme, perf=perf)
+    _perf_mark(perf, "viewer.async.build_complete")
 
     app = QApplication.instance()
     close_event = asyncio.Event()
@@ -1399,7 +1431,12 @@ async def _run_orthoviewer_async(zarr_uri: str, theme: str = "dark") -> None:
 # ---------------------------------------------------------------------------
 
 
-def launch_orthoviewer(zarr_uri: str, theme: str = "dark") -> None:
+def launch_orthoviewer(
+    zarr_uri: str,
+    theme: str = "dark",
+    *,
+    perf: StartupPerfTracer | None = None,
+) -> None:
     """Open an orthoviewer window and block until it is closed.
 
     Creates a ``QApplication`` if one does not already exist, then runs the
@@ -1413,14 +1450,22 @@ def launch_orthoviewer(zarr_uri: str, theme: str = "dark") -> None:
     theme : str
         Registered theme name. Defaults to ``"dark"``.
         Use ``oz_viewer.theme.list_themes()`` to see available themes.
+    perf : StartupPerfTracer | None, optional
+        Optional startup performance tracer used to record timing milestones
+        during viewer launch and startup.
     """
     import sys
 
     import PySide6.QtAsyncio as QtAsyncio
     from PySide6.QtWidgets import QApplication
 
+    _perf_mark(perf, "viewer.launch.start", theme=theme)
     app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
-    QtAsyncio.run(_run_orthoviewer_async(zarr_uri, theme=theme), handle_sigint=True)
+    _perf_mark(perf, "viewer.launch.qapp_ready")
+    QtAsyncio.run(
+        _run_orthoviewer_async(zarr_uri, theme=theme, perf=perf),
+        handle_sigint=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1428,13 +1473,20 @@ def launch_orthoviewer(zarr_uri: str, theme: str = "dark") -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
+def _build_and_show(
+    zarr_uri: str,
+    theme: str = "dark",
+    *,
+    perf: StartupPerfTracer | None = None,
+) -> OmeZarrOrthoViewer:
     """Build the full viewer from a zarr URI and show the window."""
     from PySide6.QtWidgets import QApplication
 
     from oz_viewer.theme import apply_theme
 
+    _perf_mark(perf, "viewer.build.start", theme=theme)
     apply_theme(QApplication.instance(), theme)
+    _perf_mark(perf, "viewer.build.theme_applied")
     import yaozarrs
     from cellier.v2.controller import CellierController
     from cellier.v2.gui._scene import QtCanvasWidget, QtDimsSliders
@@ -1448,7 +1500,8 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         CenteredAxes2DAppearance,
     )
 
-    viewer_model = build_ortho_viewer_model(zarr_uri)
+    viewer_model = build_ortho_viewer_model(zarr_uri, perf=perf)
+    _perf_mark(perf, "viewer.build.model_ready")
 
     controller = CellierController.from_model(
         viewer_model,
@@ -1458,6 +1511,7 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         ),
         widget_parent=None,
     )
+    _perf_mark(perf, "viewer.build.controller_ready")
 
     xy_scene = controller.get_scene_by_name("xy")
     xz_scene = controller.get_scene_by_name("xz")
@@ -1508,6 +1562,7 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         initial_centre_zyx=initial_centre_zyx,
         world_min_extent=float(world_max_zyx.min()),
     )
+    _perf_mark(perf, "viewer.build.axis_meshes_ready")
 
     # Slice plane mesh overlay
     _INITIAL_PLANE_OPACITY = 1.0
@@ -1520,6 +1575,7 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         world_max_zyx,
         initial_opacity=_INITIAL_PLANE_OPACITY,
     )
+    _perf_mark(perf, "viewer.build.plane_mesh_ready")
 
     plane_updater = _PlaneUpdater(
         controller=controller,
@@ -1586,6 +1642,51 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         "yz": _make_canvas_widget(yz_scene, _SLIDER_STYLE_YZ),
         "vol": vol_cw,
     }
+    _perf_mark(perf, "viewer.build.canvas_widgets_ready")
+
+    paint_tracker = None
+    settled_timer = None
+    if perf is not None and perf.enabled:
+        from PySide6.QtCore import QEvent, QObject, QTimer
+
+        paint_seen: set[str] = set()
+        quiet_ms = 300
+        total_canvases = len(canvas_widgets)
+
+        settled_timer = QTimer()
+        settled_timer.setSingleShot(True)
+        settled_timer.setInterval(quiet_ms)
+
+        def _on_settled() -> None:
+            if len(paint_seen) == total_canvases:
+                _perf_mark(perf, "viewer.canvas.startup_settled", quiet_ms=quiet_ms)
+                perf.report_rich_table()
+
+        settled_timer.timeout.connect(_on_settled)
+
+        class _CanvasPaintTracker(QObject):
+            def eventFilter(self, watched, event):
+                if event.type() != QEvent.Type.Paint:
+                    return False
+                for scene_name, canvas_widget in canvas_widgets.items():
+                    if watched is canvas_widget.widget and scene_name not in paint_seen:
+                        paint_seen.add(scene_name)
+                        _perf_mark(
+                            perf,
+                            "viewer.canvas.first_paint",
+                            scene=scene_name,
+                            n_seen=len(paint_seen),
+                            n_total=total_canvases,
+                        )
+                        if len(paint_seen) == total_canvases:
+                            _perf_mark(perf, "viewer.canvas.all_first_paint")
+                        settled_timer.start()
+                        break
+                return False
+
+        paint_tracker = _CanvasPaintTracker()
+        for canvas_widget in canvas_widgets.values():
+            canvas_widget.widget.installEventFilter(paint_tracker)
 
     # Screen-space 2D axis overlays
     xy_axes_overlay = controller.add_canvas_overlay_model(
@@ -1654,7 +1755,10 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         transparency_manager=transparency_manager,
     )
     viewer._transparency_manager = transparency_manager
+    if paint_tracker is not None:
+        viewer._startup_perf_objects = (paint_tracker, settled_timer)
     viewer.window.show()
+    _perf_mark(perf, "viewer.window.show_called")
 
     # 3D orientation overlay wiring
     orient_updater = _OrientationUpdater(
@@ -1686,9 +1790,12 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
 
     for scene in scenes.values():
         controller.fit_camera(scene.id)
+        _perf_mark(perf, "viewer.scene.fit_camera", scene=scene.name)
         controller.reslice_scene(scene.id)
+        _perf_mark(perf, "viewer.scene.reslice_requested", scene=scene.name)
 
     transparency_manager.apply()
+    _perf_mark(perf, "viewer.transparency.apply_done")
 
     # Seed 3D orientation with post-fit camera state
     def _seed_camera_event(scene_id):
@@ -1706,4 +1813,5 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
     orient_updater.on_xz_camera_changed(_seed_camera_event(xz_scene.id))
     orient_updater.on_yz_camera_changed(_seed_camera_event(yz_scene.id))
 
+    _perf_mark(perf, "viewer.build.done")
     return viewer

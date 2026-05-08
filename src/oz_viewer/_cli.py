@@ -18,6 +18,11 @@ from oz_viewer._display import (
     print_ping_results,
     print_success_panel,
 )
+from oz_viewer._perf import (
+    StartupPerfTracer,
+    configure_perf_logging,
+    perf_enabled_from_env,
+)
 
 app = typer.Typer(
     name="oz-viewer",
@@ -151,15 +156,57 @@ def ortho(
             ),
         ),
     ] = "dark",
+    perf_startup: Annotated[
+        bool,
+        typer.Option(
+            "--perf-startup/--no-perf-startup",
+            help="Enable startup performance logging diagnostics.",
+        ),
+    ] = False,
+    perf_log_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--perf-log-file",
+            help="Write startup performance logs to a file instead of stderr.",
+            show_default=False,
+        ),
+    ] = None,
+    perf_table: Annotated[
+        bool,
+        typer.Option(
+            "--perf-table/--no-perf-table",
+            help="Display startup timings as a Rich table at startup completion.",
+        ),
+    ] = False,
+    perf_table_title: Annotated[
+        str,
+        typer.Option(
+            "--perf-table-title",
+            help="Title used for the startup performance Rich table.",
+        ),
+    ] = "Orthoviewer startup timings",
 ) -> None:
     """Open an OME-Zarr store in the 4-panel orthoviewer."""
     from oz_viewer.viewer import launch_orthoviewer
+
+    perf_enabled = perf_startup or perf_enabled_from_env()
+    configure_perf_logging(
+        enabled=perf_enabled,
+        log_file=str(perf_log_file) if perf_log_file is not None else None,
+    )
+    perf = StartupPerfTracer(
+        enabled=perf_enabled,
+        show_table=perf_table,
+        table_title=perf_table_title,
+    )
+    perf.mark("cli.ortho.start", make_example=make_example, theme=theme)
 
     if make_example:
         from oz_viewer.data._blobs import make_example_zarr
 
         zarr_path = make_example_zarr()
         zarr_uri = f"file://{zarr_path}"
+        perf.mark("cli.ortho.example_created", zarr_path=zarr_path)
     else:
         raw = path or path_option
         if raw is None:
@@ -176,8 +223,10 @@ def ortho(
             )
             raise typer.Exit(code=1)
         zarr_uri = _resolve_zarr_uri(raw)
+        perf.mark("cli.ortho.uri_resolved", zarr_uri=zarr_uri)
 
-    launch_orthoviewer(zarr_uri, theme=theme)
+    perf.mark("cli.ortho.launch")
+    launch_orthoviewer(zarr_uri, theme=theme, perf=perf)
 
 
 @app.command(name="theme")
