@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from uuid import uuid4
 
 import numpy as np
@@ -81,6 +82,182 @@ _AXIS_3D_CUBE_SIDE_FRACTION: float = 0.024
 _AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
 _AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
 _N_FACES_PER_BOX: int = 12
+
+_TRANSPARENCY_MODES: list[str] = ["weighted_blend", "blend", "dither", "solid"]
+
+
+@dataclass
+class _VolTransparencyProfile:
+    transparency_mode: str
+    opacity: float
+
+
+_ISO_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 0.3)
+_MIP_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 1.0)
+
+
+@dataclass
+class _VisualRenderProfile:
+    render_order: int
+    depth_test: bool
+    depth_write: bool
+    transparency_mode: str
+    opacity: float
+
+
+_ISO_PLANE_PROFILE = _VisualRenderProfile(
+    render_order=0,
+    depth_test=True,
+    depth_write=True,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+_MIP_PLANE_PROFILE = _VisualRenderProfile(
+    render_order=1,
+    depth_test=False,
+    depth_write=True,
+    transparency_mode="weighted_blend",
+    opacity=0.99,
+)
+_ISO_AXES_PROFILE = _VisualRenderProfile(
+    render_order=1,
+    depth_test=True,
+    depth_write=True,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+_MIP_AXES_PROFILE = _VisualRenderProfile(
+    render_order=2,
+    depth_test=False,
+    depth_write=False,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+
+
+# ---------------------------------------------------------------------------
+# Volume transparency manager
+# ---------------------------------------------------------------------------
+
+
+class _VolTransparencyManager:
+    """Manages transparency profiles for the each render mode."""
+
+    def __init__(
+        self,
+        gfx_vol_visual,
+        gfx_plane_visual=None,
+        gfx_axis_visuals: list | None = None,
+    ) -> None:
+        self._gfx_vol_visual = gfx_vol_visual
+        self._gfx_plane_visual = gfx_plane_visual
+        self._gfx_axis_visuals: list = gfx_axis_visuals or []
+        self._vol_profiles: dict[str, _VolTransparencyProfile] = {
+            "iso": _VolTransparencyProfile(
+                transparency_mode=_ISO_DEFAULT_TRANSPARENCY.transparency_mode,
+                opacity=_ISO_DEFAULT_TRANSPARENCY.opacity,
+            ),
+            "mip": _VolTransparencyProfile(
+                transparency_mode=_MIP_DEFAULT_TRANSPARENCY.transparency_mode,
+                opacity=_MIP_DEFAULT_TRANSPARENCY.opacity,
+            ),
+        }
+        self._plane_profiles: dict[str, _VisualRenderProfile] = {
+            "iso": _ISO_PLANE_PROFILE,
+            "mip": _MIP_PLANE_PROFILE,
+        }
+        self._axes_profiles: dict[str, _VisualRenderProfile] = {
+            "iso": _ISO_AXES_PROFILE,
+            "mip": _MIP_AXES_PROFILE,
+        }
+        self._current_mode = "iso"
+
+    @property
+    def current_mode(self) -> str:
+        return self._current_mode
+
+    @property
+    def current_profile(self) -> _VolTransparencyProfile:
+        return self._vol_profiles[self._current_mode]
+
+    @staticmethod
+    def _apply_profile_to_mesh(
+        gfx_visual, profile: _VisualRenderProfile, label: str = ""
+    ) -> None:
+        tag = f"[transparency] {label}" if label else "[transparency]"
+        if gfx_visual is None:
+            print(f"{tag}  gfx_visual is None — skipping")
+            return
+        mat = getattr(gfx_visual, "_material_3d", None)
+        if mat is None:
+            print(
+                f"{tag}  no ._material_3d on {type(gfx_visual).__name__} — skipping"
+                f"  (attrs: {[a for a in dir(gfx_visual) if 'mat' in a.lower()]})"
+            )
+            return
+        mat.alpha_mode = profile.transparency_mode
+        mat.opacity = profile.opacity
+        mat.depth_test = profile.depth_test
+        mat.depth_write = profile.depth_write
+        gfx_visual.render_order = profile.render_order
+        print(
+            f"{tag}  type={type(gfx_visual).__name__}"
+            f"  alpha_mode={mat.alpha_mode!r}"
+            f"  opacity={mat.opacity}"
+            f"  depth_test={mat.depth_test}"
+            f"  depth_write={mat.depth_write}"
+            f"  render_order={gfx_visual.render_order}"
+        )
+
+    def apply(self) -> None:
+        print(f"[transparency] applying mode={self._current_mode!r}")
+
+        # Volume
+        if self._gfx_vol_visual is not None:
+            mat = self._gfx_vol_visual.material_3d
+            if mat is not None:
+                vol = self.current_profile
+                mat.alpha_mode = vol.transparency_mode
+                mat.opacity = vol.opacity
+                mat.depth_write = vol.transparency_mode == "solid"
+                print(
+                    f"[transparency] volume"
+                    f"  alpha_mode={mat.alpha_mode}"
+                    f"  opacity={mat.opacity}"
+                    f"  depth_write={mat.depth_write}"
+                )
+            else:
+                print("[transparency] volume  material_3d is None — skipping")
+        else:
+            print("[transparency] volume  gfx_vol_visual is None — skipping")
+
+        # Planes
+        plane_profile = self._plane_profiles[self._current_mode]
+        self._apply_profile_to_mesh(
+            self._gfx_plane_visual, plane_profile, label="plane"
+        )
+
+        # Axes
+        axes_profile = self._axes_profiles[self._current_mode]
+        for i, gfx_axis in enumerate(self._gfx_axis_visuals):
+            self._apply_profile_to_mesh(gfx_axis, axes_profile, label=f"axis[{i}]")
+
+    def on_render_mode_changed(self, new_mode: str) -> None:
+        if new_mode in self._vol_profiles:
+            self._current_mode = new_mode
+        elif new_mode.startswith("mip"):
+            self._current_mode = "mip"
+        else:
+            self._current_mode = "iso"
+        self.apply()
+
+    def update_transparency_mode(self, transparency_mode: str) -> None:
+        self.current_profile.transparency_mode = transparency_mode
+        self.apply()
+
+    def update_opacity(self, opacity: float) -> None:
+        self.current_profile.opacity = opacity
+        self.apply()
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +376,13 @@ class OmeZarrOrthoViewer:
         canvas_widgets: dict,
         clim_range: tuple[float, float],
         slider_decimals: int = 2,
-        plane_visual=None,
-        plane_store=None,
         gfx_vol_visual=None,
-        initial_plane_opacity: float = 0.4,
         axes_2d_overlay_ids: list | None = None,
         orient_3d_visual_ids: list | None = None,
+        plane_visual=None,
+        plane_store=None,
+        initial_plane_opacity: float = 0.4,
+        transparency_manager: _VolTransparencyManager | None = None,
     ):
         from cellier.v2.gui.visuals._colormap import QtColormapComboBox
         from cellier.v2.gui.visuals._contrast_limits import QtClimRangeSlider
@@ -294,13 +472,13 @@ class OmeZarrOrthoViewer:
             cell_layout.addWidget(canvas_widgets[key].widget, stretch=1)
             grid.addWidget(cell, row, col)
 
-        root_layout.addWidget(grid_widget, stretch=1)
-
         panel = QtWidgets.QWidget()
         panel.setFixedWidth(300)
         panel_layout = QtWidgets.QVBoxLayout(panel)
         panel_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         root_layout.addWidget(panel)
+
+        root_layout.addWidget(grid_widget, stretch=1)
 
         group_2d = QtWidgets.QGroupBox("2D Rendering")
         layout_2d = QtWidgets.QVBoxLayout(group_2d)
@@ -343,12 +521,74 @@ class OmeZarrOrthoViewer:
         QtWidgets.QVBoxLayout(render_3d_box).addWidget(self._3d_render.widget)
         layout_3d.addWidget(render_3d_box)
 
-        if orient_3d_visual_ids:
-            from cellier.v2.events import (
-                AppearanceUpdateEvent as _AppearanceUpdateEvent,
-            )
-            from PySide6.QtWidgets import QCheckBox
+        if transparency_manager is not None:
+            from PySide6.QtCore import Qt
+            from PySide6.QtWidgets import QComboBox
+            from superqt import QLabeledDoubleSlider
 
+            trans_box = QtWidgets.QGroupBox("Transparency")
+            layout_trans = QtWidgets.QVBoxLayout(trans_box)
+
+            _trans_mode_label = QtWidgets.QLabel(
+                f"Active mode: {transparency_manager.current_mode.upper()}"
+            )
+            _trans_mode_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            _trans_mode_label.setStyleSheet("font-style: italic; font-size: 10px;")
+            layout_trans.addWidget(_trans_mode_label)
+
+            _trans_mode_row = QtWidgets.QWidget()
+            _trans_mode_row_layout = QtWidgets.QHBoxLayout(_trans_mode_row)
+            _trans_mode_row_layout.setContentsMargins(0, 0, 0, 0)
+            _trans_mode_row_layout.addWidget(QtWidgets.QLabel("Mode"))
+            _trans_mode_combo = QComboBox()
+            for _tm in _TRANSPARENCY_MODES:
+                _trans_mode_combo.addItem(_tm)
+            _trans_mode_combo.setCurrentText(
+                transparency_manager.current_profile.transparency_mode
+            )
+            _trans_mode_row_layout.addWidget(_trans_mode_combo)
+            layout_trans.addWidget(_trans_mode_row)
+
+            layout_trans.addWidget(QtWidgets.QLabel("Opacity"))
+            _trans_opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
+            _trans_opacity_slider.setRange(0.0, 1.0)
+            _trans_opacity_slider.setValue(transparency_manager.current_profile.opacity)
+            _trans_opacity_slider.setDecimals(2)
+            layout_trans.addWidget(_trans_opacity_slider)
+
+            def _sync_trans_controls() -> None:
+                profile = transparency_manager.current_profile
+                _trans_mode_label.setText(
+                    f"Active mode: {transparency_manager.current_mode.upper()}"
+                )
+                _trans_mode_combo.blockSignals(True)
+                _trans_mode_combo.setCurrentText(profile.transparency_mode)
+                _trans_mode_combo.blockSignals(False)
+                _trans_opacity_slider.blockSignals(True)
+                _trans_opacity_slider.setValue(profile.opacity)
+                _trans_opacity_slider.blockSignals(False)
+
+            def _on_trans_mode_combo_changed(text: str) -> None:
+                transparency_manager.update_transparency_mode(text)
+
+            def _on_trans_opacity_changed(value: float) -> None:
+                transparency_manager.update_opacity(value)
+
+            def _on_render_mode_event(event) -> None:
+                if hasattr(event, "field") and event.field == "render_mode":
+                    transparency_manager.on_render_mode_changed(event.value)
+                    _sync_trans_controls()
+
+            _trans_mode_combo.currentTextChanged.connect(_on_trans_mode_combo_changed)
+            _trans_opacity_slider.valueChanged.connect(_on_trans_opacity_changed)
+            self._3d_render.changed.connect(_on_render_mode_event)
+
+            layout_3d.addWidget(trans_box)
+
+        from cellier.v2.events import AppearanceUpdateEvent as _AppearanceUpdateEvent
+        from PySide6.QtWidgets import QCheckBox
+
+        if orient_3d_visual_ids:
             orient_3d_cb = QCheckBox("Show orientation axes")
             orient_3d_cb.setChecked(True)
             _orient_3d_bid = uuid4()
@@ -369,29 +609,12 @@ class OmeZarrOrthoViewer:
 
         panel_layout.addWidget(group_3d)
 
-        if plane_visual is not None or gfx_vol_visual is not None:
+        if plane_visual is not None:
             from PySide6.QtCore import Qt
             from superqt import QLabeledDoubleSlider
 
             group_planes = QtWidgets.QGroupBox("Plane Overlay")
             layout_planes = QtWidgets.QVBoxLayout(group_planes)
-
-            vol_opacity_label = QtWidgets.QLabel("Volume opacity")
-            vol_opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
-            vol_opacity_slider.setRange(0.0, 1.0)
-            vol_opacity_slider.setValue(1.0)
-            vol_opacity_slider.setDecimals(2)
-
-            def _on_vol_opacity_changed(value: float) -> None:
-                if (
-                    gfx_vol_visual is not None
-                    and gfx_vol_visual.material_3d is not None
-                ):
-                    gfx_vol_visual.material_3d.opacity = value
-
-            vol_opacity_slider.valueChanged.connect(_on_vol_opacity_changed)
-            layout_planes.addWidget(vol_opacity_label)
-            layout_planes.addWidget(vol_opacity_slider)
 
             plane_opacity_label = QtWidgets.QLabel("Plane opacity")
             plane_opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
@@ -401,8 +624,13 @@ class OmeZarrOrthoViewer:
 
             def _on_plane_opacity_changed(value: float) -> None:
                 if plane_visual is not None:
-                    controller.update_appearance_field(
-                        plane_visual.id, "opacity", value
+                    controller.incoming_events.emit(
+                        _AppearanceUpdateEvent(
+                            source_id=uuid4(),
+                            visual_id=plane_visual.id,
+                            field="opacity",
+                            value=value,
+                        )
                     )
                 if plane_store is not None:
                     plane_store.colors = _make_plane_colors(value)
@@ -595,9 +823,10 @@ def _make_axis_meshes(
             side="both",
             opacity=1.0,
             render_order=1,
-            depth_test=False,
-            depth_write=False,
+            depth_test=True,
+            depth_write=True,
             depth_compare="<=",
+            transparency_mode="blend",
         )
         visual = controller.add_mesh(
             data=store,
@@ -855,27 +1084,43 @@ def build_ortho_viewer_model(zarr_uri: str):
         MultiscaleImageRenderConfig,
         MultiscaleImageVisual,
     )
+    from rich.console import Console
+    from rich.table import Table
 
-    print(f"Opening OME-Zarr store: {zarr_uri}")
     data_store = OMEZarrImageDataStore.from_path(zarr_uri)
-    print(f"  {data_store.n_levels} levels found.")
-    for i, shape in enumerate(data_store.level_shapes):
-        print(f"  Level {i}: shape={shape}")
-    print(f"  Axes:  {data_store.axis_names}")
-    print(f"  Units: {data_store.axis_units}")
 
     group = yaozarrs.open_group(data_store.zarr_path)
     ome_image = group.ome_metadata()
     ms = ome_image.multiscales[data_store.multiscale_index]
     level_0_scale_zyx = np.array(ms.datasets[0].scale_transform.scale, dtype=np.float64)
-    print(f"\n  Level-0 physical scale (ZYX): {level_0_scale_zyx}")
 
     vox_shape_zyx = np.array(data_store.level_shapes[0], dtype=np.float64)
     world_extents_zyx = vox_shape_zyx * level_0_scale_zyx
     max_extent = float(world_extents_zyx.max())
     depth_range = (max(1.0, max_extent * 0.0001), max_extent * 10.0)
-    print(f"  World extents (ZYX): {world_extents_zyx}")
-    print(f"  Depth range: near={depth_range[0]:.2f}  far={depth_range[1]:.0f}\n")
+
+    table = Table(
+        title=f"OME-Zarr  [dim]{zarr_uri}[/dim]",
+        show_header=False,
+        box=None,
+        padding=(0, 2),
+    )
+    table.add_column("Field", style="bold cyan", no_wrap=True)
+    table.add_column("Value")
+
+    table.add_row("dtype", str(data_store.dtype))
+    table.add_row("axes", "  ".join(data_store.axis_names))
+    table.add_row("units", "  ".join(str(u) for u in data_store.axis_units))
+    table.add_row("levels", str(data_store.n_levels))
+    for i, shape in enumerate(data_store.level_shapes):
+        table.add_row(f"  level {i}", str(list(shape)))
+    table.add_row("scale (ZYX)", "  ".join(f"{v:.4g}" for v in level_0_scale_zyx))
+    table.add_row(
+        "world extents (ZYX)", "  ".join(f"{v:.4g}" for v in world_extents_zyx)
+    )
+    table.add_row("depth range", f"near={depth_range[0]:.2f}  far={depth_range[1]:.0f}")
+
+    Console().print(table)
 
     cs = CoordinateSystem(name="world", axis_labels=("z", "y", "x"))
     voxel_to_world = AffineTransform.from_scale_and_translation(
@@ -892,7 +1137,7 @@ def build_ortho_viewer_model(zarr_uri: str):
     coarsest_level = data_store.n_levels - 1
 
     common_2d_appearance = ImageAppearance(
-        color_map="grays",
+        color_map="viridis",
         clim=(0.0, initial_clim_max),
         lod_bias=1.0,
         force_level=None,
@@ -981,12 +1226,12 @@ def build_ortho_viewer_model(zarr_uri: str):
         data_store_id=str(data_store.id),
         level_transforms=data_store.level_transforms,
         appearance=ImageAppearance(
-            color_map="grays",
+            color_map="white",
             clim=(0.0, initial_clim_max),
             lod_bias=1.0,
             force_level=coarsest_level,
             frustum_cull=False,
-            iso_threshold=0.2,
+            iso_threshold=initial_clim_max / 2.0,
             render_mode="iso",
         ),
         render_config=MultiscaleImageRenderConfig(
@@ -1294,6 +1539,17 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
 
     scene_mgr = controller._render_manager._scenes[vol_scene.id]
     gfx_vol_visual = scene_mgr.get_visual(visuals["vol"].id)
+    gfx_plane_visual = scene_mgr.get_visual(plane_visual.id)
+    gfx_axis_visuals = [
+        scene_mgr.get_visual(xy_axis_visual.id),
+        scene_mgr.get_visual(xz_axis_visual.id),
+        scene_mgr.get_visual(yz_axis_visual.id),
+    ]
+    transparency_manager = _VolTransparencyManager(
+        gfx_vol_visual,
+        gfx_plane_visual=gfx_plane_visual,
+        gfx_axis_visuals=gfx_axis_visuals,
+    )
 
     def _canvas_view(scene_id):
         canvas_id = controller.get_canvas_ids(scene_id)[0]
@@ -1385,17 +1641,19 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         canvas_widgets=canvas_widgets,
         clim_range=clim_range,
         slider_decimals=slider_decimals,
-        plane_visual=plane_visual,
-        plane_store=plane_store,
         gfx_vol_visual=gfx_vol_visual,
-        initial_plane_opacity=_INITIAL_PLANE_OPACITY,
         axes_2d_overlay_ids=[
             xy_axes_overlay.id,
             xz_axes_overlay.id,
             yz_axes_overlay.id,
         ],
         orient_3d_visual_ids=[xy_axis_visual.id, xz_axis_visual.id, yz_axis_visual.id],
+        plane_visual=plane_visual,
+        plane_store=plane_store,
+        initial_plane_opacity=_INITIAL_PLANE_OPACITY,
+        transparency_manager=transparency_manager,
     )
+    viewer._transparency_manager = transparency_manager
     viewer.window.show()
 
     # 3D orientation overlay wiring
@@ -1430,6 +1688,8 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         controller.fit_camera(scene.id)
         controller.reslice_scene(scene.id)
 
+    transparency_manager.apply()
+
     # Seed 3D orientation with post-fit camera state
     def _seed_camera_event(scene_id):
         from cellier.v2.events._events import CameraChangedEvent
@@ -1437,7 +1697,7 @@ def _build_and_show(zarr_uri: str, theme: str = "dark") -> OmeZarrOrthoViewer:
         canvas_view = controller.get_canvas_view(controller.get_canvas_ids(scene_id)[0])
         camera_state = canvas_view._capture_camera_state()
         return CameraChangedEvent(
-            source_id=canvas_view._canvas_id,
+            source_id=canvas_view.canvas_id,
             scene_id=scene_id,
             camera_state=camera_state,
         )
