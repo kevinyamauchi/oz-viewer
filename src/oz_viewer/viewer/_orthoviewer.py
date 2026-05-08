@@ -89,6 +89,30 @@ _N_FACES_PER_BOX: int = 12
 
 _TRANSPARENCY_MODES: list[str] = ["weighted_blend", "blend", "dither", "solid"]
 
+_DEFAULT_COLORMAPS: list[str] = [
+    "viridis",
+    "plasma",
+    "white",
+    "green",
+    "blue",
+    "red",
+    "magenta",
+    "cyan",
+    "bop_blue",
+    "bop_orange",
+    "bop_purple",
+    "i_blue",
+    "i_bordeaux",
+    "i_cyan",
+    "i_forest",
+    "i_green",
+    "i_magenta",
+    "i_orange",
+    "i_purple",
+    "i_red",
+    "i_yellow",
+]
+
 
 @dataclass
 class _VolTransparencyProfile:
@@ -342,6 +366,7 @@ class _MultiVisualColormapCombo:
         self._AppearanceUpdateEvent = AppearanceUpdateEvent
 
         self._combo = QColormapComboBox(parent)
+        self._combo.addColormaps(_DEFAULT_COLORMAPS)
         self._combo.setCurrentColormap(initial_colormap)
         self._combo.currentColormapChanged.connect(self._on_changed)
 
@@ -429,6 +454,7 @@ class OmeZarrOrthoViewer:
             vol_id,
             initial_colormap=visuals["vol"].appearance.color_map,
         )
+        self._3d_colormap.widget.addColormaps(_DEFAULT_COLORMAPS)
         controller.connect_widget(
             self._3d_colormap,
             subscription_specs=self._3d_colormap.subscription_specs(),
@@ -526,68 +552,12 @@ class OmeZarrOrthoViewer:
         layout_3d.addWidget(render_3d_box)
 
         if transparency_manager is not None:
-            from PySide6.QtCore import Qt
-            from PySide6.QtWidgets import QComboBox
-            from superqt import QLabeledDoubleSlider
-
-            trans_box = QtWidgets.QGroupBox("Transparency")
-            layout_trans = QtWidgets.QVBoxLayout(trans_box)
-
-            _trans_mode_label = QtWidgets.QLabel(
-                f"Active mode: {transparency_manager.current_mode.upper()}"
-            )
-            _trans_mode_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            _trans_mode_label.setStyleSheet("font-style: italic; font-size: 10px;")
-            layout_trans.addWidget(_trans_mode_label)
-
-            _trans_mode_row = QtWidgets.QWidget()
-            _trans_mode_row_layout = QtWidgets.QHBoxLayout(_trans_mode_row)
-            _trans_mode_row_layout.setContentsMargins(0, 0, 0, 0)
-            _trans_mode_row_layout.addWidget(QtWidgets.QLabel("Mode"))
-            _trans_mode_combo = QComboBox()
-            for _tm in _TRANSPARENCY_MODES:
-                _trans_mode_combo.addItem(_tm)
-            _trans_mode_combo.setCurrentText(
-                transparency_manager.current_profile.transparency_mode
-            )
-            _trans_mode_row_layout.addWidget(_trans_mode_combo)
-            layout_trans.addWidget(_trans_mode_row)
-
-            layout_trans.addWidget(QtWidgets.QLabel("Opacity"))
-            _trans_opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
-            _trans_opacity_slider.setRange(0.0, 1.0)
-            _trans_opacity_slider.setValue(transparency_manager.current_profile.opacity)
-            _trans_opacity_slider.setDecimals(2)
-            layout_trans.addWidget(_trans_opacity_slider)
-
-            def _sync_trans_controls() -> None:
-                profile = transparency_manager.current_profile
-                _trans_mode_label.setText(
-                    f"Active mode: {transparency_manager.current_mode.upper()}"
-                )
-                _trans_mode_combo.blockSignals(True)
-                _trans_mode_combo.setCurrentText(profile.transparency_mode)
-                _trans_mode_combo.blockSignals(False)
-                _trans_opacity_slider.blockSignals(True)
-                _trans_opacity_slider.setValue(profile.opacity)
-                _trans_opacity_slider.blockSignals(False)
-
-            def _on_trans_mode_combo_changed(text: str) -> None:
-                transparency_manager.update_transparency_mode(text)
-
-            def _on_trans_opacity_changed(value: float) -> None:
-                transparency_manager.update_opacity(value)
 
             def _on_render_mode_event(event) -> None:
                 if hasattr(event, "field") and event.field == "render_mode":
                     transparency_manager.on_render_mode_changed(event.value)
-                    _sync_trans_controls()
 
-            _trans_mode_combo.currentTextChanged.connect(_on_trans_mode_combo_changed)
-            _trans_opacity_slider.valueChanged.connect(_on_trans_opacity_changed)
             self._3d_render.changed.connect(_on_render_mode_event)
-
-            layout_3d.addWidget(trans_box)
 
         from cellier.v2.events import AppearanceUpdateEvent as _AppearanceUpdateEvent
         from PySide6.QtWidgets import QCheckBox
@@ -617,10 +587,10 @@ class OmeZarrOrthoViewer:
             from PySide6.QtCore import Qt
             from superqt import QLabeledDoubleSlider
 
-            group_planes = QtWidgets.QGroupBox("Plane Overlay")
+            group_planes = QtWidgets.QGroupBox("Slice Overlay")
             layout_planes = QtWidgets.QVBoxLayout(group_planes)
 
-            plane_opacity_label = QtWidgets.QLabel("Plane opacity")
+            plane_opacity_label = QtWidgets.QLabel("Slice opacity")
             plane_opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
             plane_opacity_slider.setRange(0.0, 1.0)
             plane_opacity_slider.setValue(initial_plane_opacity)
@@ -639,6 +609,16 @@ class OmeZarrOrthoViewer:
                 if plane_store is not None:
                     plane_store.colors = _make_plane_colors(value)
                     controller.reslice_visual(plane_visual.id)
+                if orient_3d_visual_ids:
+                    for vid in orient_3d_visual_ids:
+                        controller.incoming_events.emit(
+                            _AppearanceUpdateEvent(
+                                source_id=uuid4(),
+                                visual_id=vid,
+                                field="opacity",
+                                value=value,
+                            )
+                        )
 
             plane_opacity_slider.valueChanged.connect(_on_plane_opacity_changed)
             layout_planes.addWidget(plane_opacity_label)
@@ -1802,7 +1782,7 @@ def _build_and_show(
         from cellier.v2.events._events import CameraChangedEvent
 
         canvas_view = controller.get_canvas_view(controller.get_canvas_ids(scene_id)[0])
-        camera_state = canvas_view._capture_camera_state()
+        camera_state = canvas_view.capture_camera_state()
         return CameraChangedEvent(
             source_id=canvas_view.canvas_id,
             scene_id=scene_id,
