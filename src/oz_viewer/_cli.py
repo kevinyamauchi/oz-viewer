@@ -146,6 +146,17 @@ def ortho(
             help="Create a synthetic anisotropic OME-Zarr and open it in the viewer.",
         ),
     ] = False,
+    multichannel: Annotated[
+        int | None,
+        typer.Option(
+            "--multichannel",
+            help=(
+                "Dimension index to treat as the channel axis, enabling multichannel"
+                " mode. If omitted, single-channel mode is used."
+            ),
+            show_default=False,
+        ),
+    ] = None,
     theme: Annotated[
         str,
         typer.Option(
@@ -226,7 +237,7 @@ def ortho(
         perf.mark("cli.ortho.uri_resolved", zarr_uri=zarr_uri)
 
     perf.mark("cli.ortho.launch")
-    launch_orthoviewer(zarr_uri, theme=theme, perf=perf)
+    launch_orthoviewer(zarr_uri, channel_axis=multichannel, theme=theme, perf=perf)
 
 
 @app.command(name="theme")
