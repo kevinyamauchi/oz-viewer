@@ -215,33 +215,17 @@ class _VolTransparencyManager:
         return self._vol_profiles[self._current_mode]
 
     @staticmethod
-    def _apply_profile_to_mesh(
-        gfx_visual, profile: _VisualRenderProfile, label: str = ""
-    ) -> None:
-        tag = f"[transparency] {label}" if label else "[transparency]"
+    def _apply_profile_to_mesh(gfx_visual, profile: _VisualRenderProfile) -> None:
         if gfx_visual is None:
-            print(f"{tag}  gfx_visual is None — skipping")
             return
         mat = getattr(gfx_visual, "_material_3d", None)
         if mat is None:
-            print(
-                f"{tag}  no ._material_3d on {type(gfx_visual).__name__} — skipping"
-                f"  (attrs: {[a for a in dir(gfx_visual) if 'mat' in a.lower()]})"
-            )
             return
         mat.alpha_mode = profile.transparency_mode
         mat.opacity = profile.opacity
         mat.depth_test = profile.depth_test
         mat.depth_write = profile.depth_write
         gfx_visual.render_order = profile.render_order
-        print(
-            f"{tag}  type={type(gfx_visual).__name__}"
-            f"  alpha_mode={mat.alpha_mode!r}"
-            f"  opacity={mat.opacity}"
-            f"  depth_test={mat.depth_test}"
-            f"  depth_write={mat.depth_write}"
-            f"  render_order={gfx_visual.render_order}"
-        )
 
     def _apply_vol_profile(self) -> None:
         """Apply the current volume profile to the gfx vol visual.
@@ -251,7 +235,6 @@ class _VolTransparencyManager:
         """
         gv = self._gfx_vol_visual
         if gv is None:
-            print("[transparency] volume  gfx_vol_visual is None — skipping")
             return
 
         vol = self.current_profile
@@ -268,12 +251,6 @@ class _VolTransparencyManager:
                 mat.opacity = vol.opacity
                 mat.depth_write = depth_write
                 n_applied += 1
-            print(
-                f"[transparency] volume (multichannel, {n_applied} slots)"
-                f"  alpha_mode={vol.transparency_mode}"
-                f"  opacity={vol.opacity}"
-                f"  depth_write={depth_write}"
-            )
             return
 
         # Single-channel visual: use .material_3d directly.
@@ -282,31 +259,19 @@ class _VolTransparencyManager:
             mat.alpha_mode = vol.transparency_mode
             mat.opacity = vol.opacity
             mat.depth_write = depth_write
-            print(
-                f"[transparency] volume"
-                f"  alpha_mode={mat.alpha_mode}"
-                f"  opacity={mat.opacity}"
-                f"  depth_write={mat.depth_write}"
-            )
-        else:
-            print("[transparency] volume  material_3d is None — skipping")
 
     def apply(self) -> None:
-        print(f"[transparency] applying mode={self._current_mode!r}")
-
         # Volume
         self._apply_vol_profile()
 
         # Planes
         plane_profile = self._plane_profiles[self._current_mode]
-        self._apply_profile_to_mesh(
-            self._gfx_plane_visual, plane_profile, label="plane"
-        )
+        self._apply_profile_to_mesh(self._gfx_plane_visual, plane_profile)
 
         # Axes
         axes_profile = self._axes_profiles[self._current_mode]
-        for i, gfx_axis in enumerate(self._gfx_axis_visuals):
-            self._apply_profile_to_mesh(gfx_axis, axes_profile, label=f"axis[{i}]")
+        for gfx_axis in self._gfx_axis_visuals:
+            self._apply_profile_to_mesh(gfx_axis, axes_profile)
 
     def on_render_mode_changed(self, new_mode: str) -> None:
         if new_mode in self._vol_profiles:
