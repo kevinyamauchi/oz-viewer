@@ -2328,8 +2328,19 @@ def launch_orthoviewer(
     """
     import sys
 
+    # Pre-initialise fsspec's dedicated IO event loop *before* QtAsyncio
+    # installs its Qt-integrated loop policy.  QtAsyncio.run() replaces the
+    # global asyncio loop with a Qt-coupled one; if fsspec's background thread
+    # ("fsspecIO") tries to start its own loop afterwards it sees that loop as
+    # already running and raises RuntimeError.  Calling get_loop() here forces
+    # fsspec to create and own a plain SelectorEventLoop in its worker thread
+    # ahead of time, so the two loop systems never conflict.  This is safe and
+    # cheap for local datasets too (the thread is created but never used).
+    import fsspec.asyn as _fsspec_asyn
     import PySide6.QtAsyncio as QtAsyncio
     from PySide6.QtWidgets import QApplication
+
+    _fsspec_asyn.get_loop()
 
     _perf_mark(perf, "viewer.launch.start", theme=theme)
     app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
