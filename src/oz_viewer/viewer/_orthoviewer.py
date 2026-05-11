@@ -443,6 +443,81 @@ class _MultiVisualColormapCombo:
         self.closed.emit()
 
 
+class _MultiVisualLodBiasSlider:
+    """LOD-bias slider that updates multiple visuals at once."""
+
+    from psygnal import Signal
+
+    changed = Signal(object)
+    closed = Signal()
+
+    def __init__(
+        self,
+        visual_ids: list,
+        *,
+        initial_lod_bias: float = 1.0,
+        lod_range: tuple[float, float] = (1e-6, 5.0),
+        decimals: int = 2,
+        parent=None,
+    ) -> None:
+        from cellier.v2.events import AppearanceUpdateEvent
+        from qtpy.QtCore import Qt
+        from superqt import QLabeledDoubleSlider
+
+        self._id = uuid4()
+        self._visual_ids = visual_ids
+        self._AppearanceUpdateEvent = AppearanceUpdateEvent
+
+        self._slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal, parent)
+        self._slider.setRange(*lod_range)
+        self._slider.setDecimals(decimals)
+        self._slider.setValue(initial_lod_bias)
+
+        # Fire only on release to avoid a reslice on every drag tick.
+        self._slider.sliderReleased.connect(self._on_released)
+
+    def _on_released(self) -> None:
+        value = self._slider.value()
+        for vid in self._visual_ids:
+            self.changed.emit(
+                self._AppearanceUpdateEvent(
+                    source_id=self._id,
+                    visual_id=vid,
+                    field="lod_bias",
+                    value=value,
+                )
+            )
+
+    def _on_visual_changed(self, event) -> None:
+        if event.source_id == self._id:
+            return
+        if event.field_name != "lod_bias":
+            return
+        self._slider.blockSignals(True)
+        self._slider.setValue(event.new_value)
+        self._slider.blockSignals(False)
+
+    def subscription_specs(self) -> list:
+        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+
+        if not self._visual_ids:
+            return []
+        return [
+            SubscriptionSpec(
+                event_type=AppearanceChangedEvent,
+                handler=self._on_visual_changed,
+                entity_id=self._visual_ids[0],
+            )
+        ]
+
+    @property
+    def widget(self):
+        return self._slider
+
+    def close(self) -> None:
+        self.closed.emit()
+
+
 # ---------------------------------------------------------------------------
 # Main viewer class
 # ---------------------------------------------------------------------------
@@ -495,6 +570,7 @@ class OmeZarrOrthoViewer:
         # Single-channel visual controls (None until built in SC mode).
         self._2d_clim: _MultiVisualClimSlider | None = None
         self._2d_colormap: _MultiVisualColormapCombo | None = None
+        self._2d_lod_bias: _MultiVisualLodBiasSlider | None = None
         self._3d_clim = None
         self._3d_colormap = None
         self._3d_render = None
@@ -633,6 +709,14 @@ class OmeZarrOrthoViewer:
             self._2d_colormap,
             subscription_specs=self._2d_colormap.subscription_specs(),
         )
+        self._2d_lod_bias = _MultiVisualLodBiasSlider(
+            _2d_visual_ids,
+            initial_lod_bias=visuals["xy"].appearance.lod_bias,
+        )
+        controller.connect_widget(
+            self._2d_lod_bias,
+            subscription_specs=self._2d_lod_bias.subscription_specs(),
+        )
 
         if visuals.get("vol") is not None:
             vol_id = visuals["vol"].id
@@ -690,6 +774,12 @@ class OmeZarrOrthoViewer:
             cmap_2d_box = QtWidgets.QGroupBox("Colormap")
             QtWidgets.QVBoxLayout(cmap_2d_box).addWidget(self._2d_colormap.widget)
             layout_2d.addWidget(cmap_2d_box)
+
+        if self._2d_lod_bias is not None:
+            lod_2d_box = QtWidgets.QGroupBox("Fine-coarse tile bias")
+            lod_2d_box.setToolTip("Bigger numbers render more coarse")
+            QtWidgets.QVBoxLayout(lod_2d_box).addWidget(self._2d_lod_bias.widget)
+            layout_2d.addWidget(lod_2d_box)
 
         if axes_2d_overlay_ids:
             from PySide6.QtWidgets import QCheckBox
@@ -1163,6 +1253,8 @@ class OmeZarrOrthoViewer:
             self._2d_clim.close()
         if self._2d_colormap is not None:
             self._2d_colormap.close()
+        if self._2d_lod_bias is not None:
+            self._2d_lod_bias.close()
         if self._3d_clim is not None:
             self._3d_clim.close()
         if self._3d_colormap is not None:
