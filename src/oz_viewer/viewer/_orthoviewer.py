@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 import numpy as np
@@ -89,7 +89,24 @@ _AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
 _AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
 _N_FACES_PER_BOX: int = 12
 
-_TRANSPARENCY_MODES: list[str] = ["weighted_blend", "blend", "dither", "solid"]
+_TRANSPARENCY_MODES: list[str] = ["weighted_blend", "weighted_solid", "blend", "add"]
+
+
+class _WorldGeometry(NamedTuple):
+    """Geometry derived from OME-Zarr metadata; returned by build_ortho_viewer_model."""
+
+    spatial_indices: list[int]
+    spatial_ndim: int
+    world_max_spatial: np.ndarray
+    spatial_mid_world: dict[int, float]
+    voxel_to_world: object
+    axis_ranges: dict[int, tuple[float, float]]
+    excluded_axes: set[int] | None
+    initial_clim_max: float
+    clim_range: tuple[float, float]
+    slider_decimals: int
+    n_channels: int
+
 
 _DEFAULT_COLORMAPS: list[str] = [
     "viridis",
@@ -172,18 +189,23 @@ _MIP_AXES_PROFILE = _VisualRenderProfile(
 
 
 class _VolTransparencyManager:
-    """Manages transparency profiles for the each render mode."""
+    """Manages transparency profiles for each render mode via the model layer."""
 
     def __init__(
         self,
-        gfx_vol_visual,
-        gfx_plane_visual=None,
-        gfx_axis_visuals: list | None = None,
+        controller,
+        vol_visual_id,
+        *,
+        vol_is_multichannel: bool = False,
+        plane_visual_id=None,
+        axis_visual_ids: list | None = None,
         initial_mode: str = "iso",
     ) -> None:
-        self._gfx_vol_visual = gfx_vol_visual
-        self._gfx_plane_visual = gfx_plane_visual
-        self._gfx_axis_visuals: list = gfx_axis_visuals or []
+        self._controller = controller
+        self._vol_visual_id = vol_visual_id
+        self._vol_is_multichannel = vol_is_multichannel
+        self._plane_visual_id = plane_visual_id
+        self._axis_visual_ids: list = axis_visual_ids or []
         self._vol_profiles: dict[str, _VolTransparencyProfile] = {
             "iso": _VolTransparencyProfile(
                 transparency_mode=_ISO_DEFAULT_TRANSPARENCY.transparency_mode,
@@ -214,64 +236,49 @@ class _VolTransparencyManager:
     def current_profile(self) -> _VolTransparencyProfile:
         return self._vol_profiles[self._current_mode]
 
-    @staticmethod
-    def _apply_profile_to_mesh(gfx_visual, profile: _VisualRenderProfile) -> None:
-        if gfx_visual is None:
+    def _apply_profile_to_mesh(self, visual_id, profile: _VisualRenderProfile) -> None:
+        if visual_id is None:
             return
-        mat = getattr(gfx_visual, "_material_3d", None)
-        if mat is None:
-            return
-        mat.alpha_mode = profile.transparency_mode
-        mat.opacity = profile.opacity
-        mat.depth_test = profile.depth_test
-        mat.depth_write = profile.depth_write
-        gfx_visual.render_order = profile.render_order
+        c = self._controller
+        c.update_appearance_field(visual_id, "render_order", profile.render_order)
+        c.update_appearance_field(visual_id, "depth_test", profile.depth_test)
+        c.update_appearance_field(visual_id, "depth_write", profile.depth_write)
+        c.update_appearance_field(
+            visual_id, "transparency_mode", profile.transparency_mode
+        )
+        c.update_appearance_field(visual_id, "opacity", profile.opacity)
 
     def _apply_vol_profile(self) -> None:
-        """Apply the current volume profile to the gfx vol visual.
+        """Apply the current volume profile via the model layer.
 
-        Handles both single-channel visuals (expose .material_3d directly) and
-        multichannel visuals (pool of ._slots, each with their own material_3d).
+        For multichannel visuals each ChannelAppearance is mutated directly
+        since they share no single .appearance object; the psygnal bridge then
+        routes the changes to the render layer.  For single-channel visuals
+        update_appearance_field is used so source-id threading is preserved.
         """
-        gv = self._gfx_vol_visual
-        if gv is None:
+        vid = self._vol_visual_id
+        if vid is None:
             return
-
         vol = self.current_profile
-        depth_write = vol.transparency_mode == "solid"
-
-        # Multichannel visual: iterate over all per-channel slots.
-        if hasattr(gv, "_slots"):
-            n_applied = 0
-            for slot in gv._slots:
-                mat = getattr(slot, "material_3d", None)
-                if mat is None:
-                    continue
-                mat.alpha_mode = vol.transparency_mode
-                mat.opacity = vol.opacity
-                mat.depth_write = depth_write
-                n_applied += 1
-            return
-
-        # Single-channel visual: use .material_3d directly.
-        mat = getattr(gv, "material_3d", None)
-        if mat is not None:
-            mat.alpha_mode = vol.transparency_mode
-            mat.opacity = vol.opacity
-            mat.depth_write = depth_write
+        depth_write = vol.transparency_mode == "weighted_solid"
+        if self._vol_is_multichannel:
+            visual = self._controller.get_visual_model(vid)
+            for ch in visual.channels.values():
+                ch.transparency_mode = vol.transparency_mode
+                ch.opacity = vol.opacity
+        else:
+            c = self._controller
+            c.update_appearance_field(vid, "transparency_mode", vol.transparency_mode)
+            c.update_appearance_field(vid, "opacity", vol.opacity)
+            c.update_appearance_field(vid, "depth_write", depth_write)
 
     def apply(self) -> None:
-        # Volume
         self._apply_vol_profile()
-
-        # Planes
         plane_profile = self._plane_profiles[self._current_mode]
-        self._apply_profile_to_mesh(self._gfx_plane_visual, plane_profile)
-
-        # Axes
+        self._apply_profile_to_mesh(self._plane_visual_id, plane_profile)
         axes_profile = self._axes_profiles[self._current_mode]
-        for gfx_axis in self._gfx_axis_visuals:
-            self._apply_profile_to_mesh(gfx_axis, axes_profile)
+        for vid in self._axis_visual_ids:
+            self._apply_profile_to_mesh(vid, axes_profile)
 
     def on_render_mode_changed(self, new_mode: str) -> None:
         if new_mode in self._vol_profiles:
@@ -338,6 +345,28 @@ class _MultiVisualClimSlider:
                 )
             )
 
+    def _on_visual_changed(self, event) -> None:
+        if event.source_id == self._id:
+            return
+        if event.field_name != "clim":
+            return
+        self._slider.blockSignals(True)
+        self._slider.setValue(event.new_value)
+        self._slider.blockSignals(False)
+
+    def subscription_specs(self) -> list:
+        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+
+        if not self._visual_ids:
+            return []
+        return [
+            SubscriptionSpec(
+                event_type=AppearanceChangedEvent,
+                handler=self._on_visual_changed,
+                entity_id=self._visual_ids[0],
+            )
+        ]
+
     @property
     def widget(self):
         return self._slider
@@ -384,6 +413,28 @@ class _MultiVisualColormapCombo:
                 )
             )
 
+    def _on_visual_changed(self, event) -> None:
+        if event.source_id == self._id:
+            return
+        if event.field_name != "color_map":
+            return
+        self._combo.blockSignals(True)
+        self._combo.setCurrentColormap(event.new_value)
+        self._combo.blockSignals(False)
+
+    def subscription_specs(self) -> list:
+        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+
+        if not self._visual_ids:
+            return []
+        return [
+            SubscriptionSpec(
+                event_type=AppearanceChangedEvent,
+                handler=self._on_visual_changed,
+                entity_id=self._visual_ids[0],
+            )
+        ]
+
     @property
     def widget(self):
         return self._combo
@@ -408,7 +459,6 @@ class OmeZarrOrthoViewer:
         canvas_widgets: dict,
         clim_range: tuple[float, float],
         slider_decimals: int = 2,
-        gfx_vol_visual=None,
         axes_2d_overlay_ids: list | None = None,
         orient_3d_visual_ids: list | None = None,
         plane_visual=None,
@@ -572,12 +622,17 @@ class OmeZarrOrthoViewer:
             initial_clim=visuals["xy"].appearance.clim,
             decimals=slider_decimals,
         )
-        controller.connect_widget(self._2d_clim)
+        controller.connect_widget(
+            self._2d_clim, subscription_specs=self._2d_clim.subscription_specs()
+        )
         self._2d_colormap = _MultiVisualColormapCombo(
             _2d_visual_ids,
             initial_colormap=visuals["xy"].appearance.color_map,
         )
-        controller.connect_widget(self._2d_colormap)
+        controller.connect_widget(
+            self._2d_colormap,
+            subscription_specs=self._2d_colormap.subscription_specs(),
+        )
 
         if visuals.get("vol") is not None:
             vol_id = visuals["vol"].id
@@ -594,7 +649,7 @@ class OmeZarrOrthoViewer:
                 vol_id,
                 initial_colormap=visuals["vol"].appearance.color_map,
             )
-            self._3d_colormap.widget.addColormaps(_DEFAULT_COLORMAPS)
+            self._3d_colormap.add_colormaps(_DEFAULT_COLORMAPS)
             controller.connect_widget(
                 self._3d_colormap,
                 subscription_specs=self._3d_colormap.subscription_specs(),
@@ -652,9 +707,6 @@ class OmeZarrOrthoViewer:
         page0_layout.addWidget(group_2d)
 
         if self._3d_clim is not None:
-            from cellier.v2.events import (
-                AppearanceUpdateEvent as _AppearanceUpdateEvent,
-            )
             from PySide6.QtWidgets import QCheckBox
 
             group_3d = QtWidgets.QGroupBox("3D Rendering")
@@ -684,18 +736,10 @@ class OmeZarrOrthoViewer:
             if orient_3d_visual_ids:
                 orient_3d_cb = QCheckBox("Show orientation axes")
                 orient_3d_cb.setChecked(True)
-                _orient_3d_bid = uuid4()
 
                 def _on_orient_3d_toggled(checked: bool) -> None:
                     for vid in orient_3d_visual_ids:
-                        controller.incoming_events.emit(
-                            _AppearanceUpdateEvent(
-                                source_id=_orient_3d_bid,
-                                visual_id=vid,
-                                field="visible",
-                                value=checked,
-                            )
-                        )
+                        controller.set_visual_visible(vid, checked)
 
                 orient_3d_cb.toggled.connect(_on_orient_3d_toggled)
                 layout_3d.addWidget(orient_3d_cb)
@@ -703,9 +747,6 @@ class OmeZarrOrthoViewer:
             page0_layout.addWidget(group_3d)
 
         if plane_visual is not None:
-            from cellier.v2.events import (
-                AppearanceUpdateEvent as _AppearanceUpdateEvent,
-            )
             from PySide6.QtCore import Qt
             from superqt import QLabeledDoubleSlider
 
@@ -720,27 +761,15 @@ class OmeZarrOrthoViewer:
 
             def _on_plane_opacity_changed(value: float) -> None:
                 if plane_visual is not None:
-                    controller.incoming_events.emit(
-                        _AppearanceUpdateEvent(
-                            source_id=uuid4(),
-                            visual_id=plane_visual.id,
-                            field="opacity",
-                            value=value,
-                        )
+                    controller.update_appearance_field(
+                        plane_visual.id, "opacity", value
                     )
                 if plane_store is not None:
                     plane_store.colors = _make_plane_colors(value)
                     controller.reslice_visual(plane_visual.id)
                 if orient_3d_visual_ids:
                     for vid in orient_3d_visual_ids:
-                        controller.incoming_events.emit(
-                            _AppearanceUpdateEvent(
-                                source_id=uuid4(),
-                                visual_id=vid,
-                                field="opacity",
-                                value=value,
-                            )
-                        )
+                        controller.update_appearance_field(vid, "opacity", value)
 
             plane_opacity_slider.valueChanged.connect(_on_plane_opacity_changed)
             layout_planes.addWidget(plane_opacity_label)
@@ -859,7 +888,6 @@ class OmeZarrOrthoViewer:
             block_size=32,
             gpu_budget_bytes=512 * 1024**2,
             gpu_budget_bytes_2d=64 * 1024**2,
-            use_brick_shader=True,
         )
 
         scene_keys = ["xy"] + (["xz", "yz", "vol"] if self._spatial_ndim == 3 else [])
@@ -883,23 +911,15 @@ class OmeZarrOrthoViewer:
                 _lazy_mc_vol_visual_id = mc_visual.id
 
         # Build the MC transparency manager if we now have a 3D MC visual and
-        # the plane/axis gfx visuals are already in place.
+        # the plane/axis model IDs are already in place.
         if _lazy_mc_vol_visual_id is not None and self._mc_transparency_manager is None:
-            vol_scene = self._scenes["vol"]
-            vol_scene_mgr = self._controller._render_manager._scenes[vol_scene.id]
-            gfx_mc_vol = vol_scene_mgr.get_visual(_lazy_mc_vol_visual_id)
-            gfx_plane = (
-                vol_scene_mgr.get_visual(self._plane_visual.id)
-                if self._plane_visual is not None
-                else None
-            )
-            gfx_axes = [
-                vol_scene_mgr.get_visual(vid) for vid in self._orient_3d_visual_ids
-            ]
+            plane_id = self._plane_visual.id if self._plane_visual is not None else None
             self._mc_transparency_manager = _VolTransparencyManager(
-                gfx_mc_vol,
-                gfx_plane_visual=gfx_plane,
-                gfx_axis_visuals=gfx_axes,
+                self._controller,
+                _lazy_mc_vol_visual_id,
+                vol_is_multichannel=True,
+                plane_visual_id=plane_id,
+                axis_visual_ids=list(self._orient_3d_visual_ids),
                 initial_mode="mip",
             )
 
@@ -912,14 +932,14 @@ class OmeZarrOrthoViewer:
     def _build_single_channel(self) -> None:
         """Hot-add SC visuals and build the page-0 controls panel."""
         from cellier.v2.visuals._image import (
-            ImageAppearance,
+            MultiscaleImageAppearance,
             MultiscaleImageRenderConfig,
         )
 
         initial_clim_max = self._clim_range[1]
         coarsest_level = self._data_store.n_levels - 1
 
-        common_appearance = ImageAppearance(
+        common_appearance = MultiscaleImageAppearance(
             color_map="viridis",
             clim=(0.0, initial_clim_max),
             lod_bias=1.0,
@@ -932,7 +952,6 @@ class OmeZarrOrthoViewer:
             block_size=32,
             gpu_budget_bytes=512 * 1024**2,
             gpu_budget_bytes_2d=64 * 1024**2,
-            use_brick_shader=True,
         )
 
         sc_2d_keys = ["xy"] + (["xz", "yz"] if self._spatial_ndim == 3 else [])
@@ -950,7 +969,7 @@ class OmeZarrOrthoViewer:
             self._visuals[key] = visual
 
         if self._spatial_ndim == 3:
-            vol_appearance = ImageAppearance(
+            vol_appearance = MultiscaleImageAppearance(
                 color_map="white",
                 clim=(0.0, initial_clim_max),
                 lod_bias=1.0,
@@ -963,7 +982,6 @@ class OmeZarrOrthoViewer:
                 block_size=32,
                 gpu_budget_bytes=2048 * 1024**2,
                 gpu_budget_bytes_2d=64 * 1024**2,
-                use_brick_shader=True,
             )
             vol_visual = self._controller.add_image_multiscale(
                 data=self._data_store,
@@ -976,23 +994,12 @@ class OmeZarrOrthoViewer:
             self._controller.update_appearance_field(vol_visual.id, "visible", False)
             self._visuals["vol"] = vol_visual
 
-            # Build transparency manager now that the gfx vol visual exists.
-            vol_scene_mgr = self._controller._render_manager._scenes[
-                self._scenes["vol"].id
-            ]
-            gfx_vol_visual = vol_scene_mgr.get_visual(vol_visual.id)
-            gfx_plane_visual = (
-                vol_scene_mgr.get_visual(self._plane_visual.id)
-                if self._plane_visual is not None
-                else None
-            )
-            gfx_axis_visuals = [
-                vol_scene_mgr.get_visual(vid) for vid in self._orient_3d_visual_ids
-            ]
+            plane_id = self._plane_visual.id if self._plane_visual is not None else None
             self._transparency_manager = _VolTransparencyManager(
-                gfx_vol_visual,
-                gfx_plane_visual=gfx_plane_visual,
-                gfx_axis_visuals=gfx_axis_visuals,
+                self._controller,
+                vol_visual.id,
+                plane_visual_id=plane_id,
+                axis_visual_ids=list(self._orient_3d_visual_ids),
             )
 
         self._init_sc_controls()
@@ -1047,10 +1054,6 @@ class OmeZarrOrthoViewer:
 
         # Plane opacity slider (shared with SC mode)
         if self._plane_visual is not None:
-            from cellier.v2.events import (
-                AppearanceUpdateEvent as _AppearanceUpdateEvent,
-            )
-
             plane_box = QtWidgets.QGroupBox("Slice opacity")
             plane_layout = QtWidgets.QVBoxLayout(plane_box)
             plane_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
@@ -1060,26 +1063,14 @@ class OmeZarrOrthoViewer:
             plane_slider.setValue(self._initial_plane_opacity)
 
             def _on_plane_opacity(value: float) -> None:
-                self._controller.incoming_events.emit(
-                    _AppearanceUpdateEvent(
-                        source_id=uuid4(),
-                        visual_id=self._plane_visual.id,
-                        field="opacity",
-                        value=value,
-                    )
+                self._controller.update_appearance_field(
+                    self._plane_visual.id, "opacity", value
                 )
                 if self._plane_store is not None:
                     self._plane_store.colors = _make_plane_colors(value)
                     self._controller.reslice_visual(self._plane_visual.id)
                 for vid in self._orient_3d_visual_ids:
-                    self._controller.incoming_events.emit(
-                        _AppearanceUpdateEvent(
-                            source_id=uuid4(),
-                            visual_id=vid,
-                            field="opacity",
-                            value=value,
-                        )
-                    )
+                    self._controller.update_appearance_field(vid, "opacity", value)
 
             plane_slider.valueChanged.connect(_on_plane_opacity)
             plane_layout.addWidget(plane_slider)
@@ -1859,7 +1850,7 @@ def build_ortho_viewer_model(
     from cellier.v2.transform import AffineTransform
     from cellier.v2.viewer_model import DataManager, ViewerModel
     from cellier.v2.visuals._image import (
-        ImageAppearance,
+        MultiscaleImageAppearance,
         MultiscaleImageRenderConfig,
         MultiscaleImageVisual,
     )
@@ -1950,6 +1941,18 @@ def build_ortho_viewer_model(
     }
 
     coarsest_level = data_store.n_levels - 1
+    slider_decimals = _dtype_decimals(data_store.dtype)
+    vox_shape_full = np.array(data_store.level_shapes[0], dtype=np.float64)
+    world_max_full = (vox_shape_full - 1) * level_0_scale_full
+    axis_ranges = {i: (0.0, round(float(world_max_full[i]))) for i in range(n_dims)}
+    excluded_axes: set[int] | None = (
+        {effective_channel_axis} if effective_channel_axis is not None else None
+    )
+    n_channels = (
+        int(data_store.level_shapes[0][effective_channel_axis])
+        if effective_channel_axis is not None
+        else 0
+    )
 
     # Base slice_indices fixes the channel at 0 when a channel axis is present.
     base_channel_slice: dict[int, int] = (
@@ -1960,7 +1963,7 @@ def build_ortho_viewer_model(
     # In multichannel mode, scenes are built empty — the caller hot-adds MC visuals.
     build_sc_visuals = initial_mode == "single"
 
-    common_2d_appearance = ImageAppearance(
+    common_2d_appearance = MultiscaleImageAppearance(
         color_map="viridis",
         clim=(0.0, initial_clim_max),
         lod_bias=1.0,
@@ -1973,7 +1976,6 @@ def build_ortho_viewer_model(
         block_size=32,
         gpu_budget_bytes=512 * 1024**2,
         gpu_budget_bytes_2d=64 * 1024**2,
-        use_brick_shader=True,
     )
 
     def _make_2d_canvas() -> Canvas:
@@ -2108,7 +2110,7 @@ def build_ortho_viewer_model(
             name="vol_volume",
             data_store_id=str(data_store.id),
             level_transforms=data_store.level_transforms,
-            appearance=ImageAppearance(
+            appearance=MultiscaleImageAppearance(
                 color_map="white",
                 clim=(0.0, initial_clim_max),
                 lod_bias=1.0,
@@ -2121,7 +2123,6 @@ def build_ortho_viewer_model(
                 block_size=32,
                 gpu_budget_bytes=2048 * 1024**2,
                 gpu_budget_bytes_2d=64 * 1024**2,
-                use_brick_shader=True,
             ),
             transform=voxel_to_world,
         )
@@ -2159,7 +2160,20 @@ def build_ortho_viewer_model(
     )
 
     _perf_mark(perf, "viewer.model.ready", n_scenes=len(viewer_model.scenes))
-    return viewer_model, effective_channel_axis
+    geometry = _WorldGeometry(
+        spatial_indices=spatial_indices,
+        spatial_ndim=spatial_ndim,
+        world_max_spatial=world_max_spatial,
+        spatial_mid_world=spatial_mid_world,
+        voxel_to_world=voxel_to_world,
+        axis_ranges=axis_ranges,
+        excluded_axes=excluded_axes,
+        initial_clim_max=initial_clim_max,
+        clim_range=(0.0, initial_clim_max),
+        slider_decimals=slider_decimals,
+        n_channels=n_channels,
+    )
+    return viewer_model, effective_channel_axis, geometry
 
 
 # ---------------------------------------------------------------------------
@@ -2373,7 +2387,6 @@ def _build_and_show(
     _perf_mark(perf, "viewer.build.start", theme=theme)
     apply_theme(QApplication.instance(), theme)
     _perf_mark(perf, "viewer.build.theme_applied")
-    import yaozarrs
     from cellier.v2.controller import CellierController
     from cellier.v2.gui._scene import QtCanvasWidget, QtDimsSliders
     from cellier.v2.render._config import (
@@ -2381,7 +2394,6 @@ def _build_and_show(
         SlicingConfig,
         TemporalAccumulationConfig,
     )
-    from cellier.v2.transform import AffineTransform
     from cellier.v2.visuals._canvas_overlay import (
         CenteredAxes2D,
         CenteredAxes2DAppearance,
@@ -2392,7 +2404,7 @@ def _build_and_show(
     # toggle button available.
     initial_mode = "multichannel" if channel_axis is not None else "single"
 
-    viewer_model, effective_channel_axis = build_ortho_viewer_model(
+    viewer_model, effective_channel_axis, _geo = build_ortho_viewer_model(
         zarr_uri, channel_axis=channel_axis, initial_mode=initial_mode, perf=perf
     )
     _perf_mark(perf, "viewer.build.model_ready")
@@ -2424,54 +2436,19 @@ def _build_and_show(
         "vol": _first_visual(vol_scene),
     }
 
-    # Rebuild world geometry parameters needed for widgets/overlays.
+    # Unpack geometry returned by build_ortho_viewer_model (no second zarr read).
     data_store = next(iter(viewer_model.data.stores.values()))
-    group = yaozarrs.open_group(data_store.zarr_path)
-    ome_image = group.ome_metadata()
-    ms = ome_image.multiscales[data_store.multiscale_index]
-
-    level_0_scale_full = np.array(
-        ms.datasets[0].scale_transform.scale, dtype=np.float64
-    )
-    n_dims = len(data_store.level_shapes[0])
-    if effective_channel_axis is None:
-        spatial_indices = list(range(n_dims))
-    else:
-        spatial_indices = [i for i in range(n_dims) if i != effective_channel_axis]
-    spatial_ndim = len(spatial_indices)
-
-    level_0_scale_spatial = level_0_scale_full[spatial_indices]
-    vox_shape_spatial = np.array(
-        [data_store.level_shapes[0][i] for i in spatial_indices], dtype=np.float64
-    )
-    world_max_spatial = (vox_shape_spatial - 1) * level_0_scale_spatial
-    spatial_mid_world = {
-        spatial_indices[j]: round(float(world_max_spatial[j]) / 2.0)
-        for j in range(spatial_ndim)
-    }
-
-    initial_clim_max = _dtype_clim_max(data_store.dtype)
-    slider_decimals = _dtype_decimals(data_store.dtype)
-    clim_range = (0.0, initial_clim_max)
-
-    # Transform matching the full coordinate system dimensionality.
-    voxel_to_world = AffineTransform.from_scale_and_translation(
-        scale=tuple(level_0_scale_full)
-    )
-
-    vox_shape_full = np.array(data_store.level_shapes[0], dtype=np.float64)
-    world_max_full = (vox_shape_full - 1) * level_0_scale_full
-    axis_ranges = {i: (0, round(float(world_max_full[i]))) for i in range(n_dims)}
-    # excluded_axes is used only for the vol canvas (channel has no meaning in 3D).
-    excluded_axes: set[int] | None = (
-        {effective_channel_axis} if effective_channel_axis is not None else None
-    )
-
-    n_channels = (
-        int(data_store.level_shapes[0][effective_channel_axis])
-        if effective_channel_axis is not None
-        else 0
-    )
+    spatial_indices = _geo.spatial_indices
+    spatial_ndim = _geo.spatial_ndim
+    world_max_spatial = _geo.world_max_spatial
+    spatial_mid_world = _geo.spatial_mid_world
+    voxel_to_world = _geo.voxel_to_world
+    axis_ranges = _geo.axis_ranges
+    excluded_axes = _geo.excluded_axes
+    initial_clim_max = _geo.initial_clim_max
+    clim_range = _geo.clim_range
+    slider_decimals = _geo.slider_decimals
+    n_channels = _geo.n_channels
 
     # ── Eagerly hot-add MC visuals when starting in multichannel mode ─────
     initial_multichannel_visual_ids: list | None = None
@@ -2492,7 +2469,6 @@ def _build_and_show(
             block_size=32,
             gpu_budget_bytes=512 * 1024**2,
             gpu_budget_bytes_2d=64 * 1024**2,
-            use_brick_shader=True,
         )
         mc_scene_keys = ["xy"] + (["xz", "yz", "vol"] if spatial_ndim == 3 else [])
         initial_multichannel_visual_ids = []
@@ -2514,7 +2490,6 @@ def _build_and_show(
         _perf_mark(perf, "viewer.build.mc_visuals_ready", n_channels=n_channels)
 
     # ── 3D overlay infrastructure (only for 3-D spatial data) ─────────────
-    gfx_vol_visual = None
     plane_visual = None
     plane_store = None
     transparency_manager = None
@@ -2585,29 +2560,24 @@ def _build_and_show(
             yz_scene.id, plane_updater.on_yz_dims_changed, owner_id=plane_updater._id
         )
 
-        # Transparency manager requires the vol image visual (only in single mode).
-        vol_scene_mgr = controller._render_manager._scenes[vol_scene.id]
-        _gfx_plane_visual = vol_scene_mgr.get_visual(plane_visual.id)
-        _gfx_axis_visuals = [
-            vol_scene_mgr.get_visual(xy_axis_visual.id),
-            vol_scene_mgr.get_visual(xz_axis_visual.id),
-            vol_scene_mgr.get_visual(yz_axis_visual.id),
-        ]
+        # Build the transparency manager using model-layer IDs only.
+        _plane_id = plane_visual.id
+        _axis_ids = [xy_axis_visual.id, xz_axis_visual.id, yz_axis_visual.id]
         if visuals.get("vol") is not None:
-            gfx_vol_visual = vol_scene_mgr.get_visual(visuals["vol"].id)
             transparency_manager = _VolTransparencyManager(
-                gfx_vol_visual,
-                gfx_plane_visual=_gfx_plane_visual,
-                gfx_axis_visuals=_gfx_axis_visuals,
+                controller,
+                visuals["vol"].id,
+                plane_visual_id=_plane_id,
+                axis_visual_ids=_axis_ids,
             )
         elif _mc_vol_visual_id is not None:
-            # Eager multichannel path: build the MC transparency manager now that
-            # the plane and axis gfx visuals exist. Always locks to MIP profile.
-            gfx_mc_vol_visual = vol_scene_mgr.get_visual(_mc_vol_visual_id)
+            # Eager multichannel path: always locked to MIP.
             mc_transparency_manager = _VolTransparencyManager(
-                gfx_mc_vol_visual,
-                gfx_plane_visual=_gfx_plane_visual,
-                gfx_axis_visuals=_gfx_axis_visuals,
+                controller,
+                _mc_vol_visual_id,
+                vol_is_multichannel=True,
+                plane_visual_id=_plane_id,
+                axis_visual_ids=_axis_ids,
                 initial_mode="mip",
             )
             mc_transparency_manager.apply()
@@ -2798,7 +2768,6 @@ def _build_and_show(
         canvas_widgets=canvas_widgets,
         clim_range=clim_range,
         slider_decimals=slider_decimals,
-        gfx_vol_visual=gfx_vol_visual,
         axes_2d_overlay_ids=axes_2d_overlay_ids,
         orient_3d_visual_ids=orient_3d_visual_ids,
         plane_visual=plane_visual,
