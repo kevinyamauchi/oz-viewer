@@ -8,6 +8,15 @@
 
 A viewer for ome-zarr images.
 
+## Orthoviewer startup performance diagnostics
+
+Use the orthoviewer performance flags to print startup timings
+with step and cumulative durations:
+
+```sh
+oz-viewer ortho /path/to/data.zarr --perf-startup --perf-table --perf-table-title "My Startup Profile"
+```
+
 ## Development
 
 The easiest way to get started is to use the [github cli](https://cli.github.com)
