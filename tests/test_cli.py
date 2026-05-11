@@ -133,7 +133,7 @@ def test_ortho_perf_startup_flag_enables_tracer(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
         captured["zarr_uri"] = zarr_uri
         captured["theme"] = theme
         captured["perf"] = perf
@@ -159,7 +159,7 @@ def test_ortho_perf_table_flag_sets_tracer_show_table(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
         captured["perf"] = perf
 
     monkeypatch.setitem(
@@ -183,7 +183,7 @@ def test_ortho_perf_table_title_sets_tracer_title(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
         captured["perf"] = perf
 
     monkeypatch.setitem(
@@ -214,7 +214,7 @@ def test_ortho_perf_env_enables_tracer(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
         captured["perf"] = perf
 
     monkeypatch.setitem(
