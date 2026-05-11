@@ -240,6 +240,116 @@ def ortho(
     launch_orthoviewer(zarr_uri, channel_axis=multichannel, theme=theme, perf=perf)
 
 
+@app.command()
+def view(
+    path: Annotated[
+        str | None,
+        typer.Argument(
+            help="Path or URI to the OME-Zarr store (local path, s3://, gs://, https://).",
+            show_default=False,
+        ),
+    ] = None,
+    path_option: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help=(
+                "Path or URI to the OME-Zarr store"
+                " (alternative to positional argument)."
+            ),
+            show_default=False,
+        ),
+    ] = None,
+    make_example: Annotated[
+        bool,
+        typer.Option(
+            "--make-example",
+            help="Create a synthetic anisotropic OME-Zarr and open it in the viewer.",
+        ),
+    ] = False,
+    theme: Annotated[
+        str,
+        typer.Option(
+            "--theme",
+            help=(
+                "Theme name to apply. Run 'oz-viewer theme list' to see"
+                " available themes."
+            ),
+        ),
+    ] = "dark",
+    perf_startup: Annotated[
+        bool,
+        typer.Option(
+            "--perf-startup/--no-perf-startup",
+            help="Enable startup performance logging diagnostics.",
+        ),
+    ] = False,
+    perf_log_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--perf-log-file",
+            help="Write startup performance logs to a file instead of stderr.",
+            show_default=False,
+        ),
+    ] = None,
+    perf_table: Annotated[
+        bool,
+        typer.Option(
+            "--perf-table/--no-perf-table",
+            help="Display startup timings as a Rich table at startup completion.",
+        ),
+    ] = False,
+    perf_table_title: Annotated[
+        str,
+        typer.Option(
+            "--perf-table-title",
+            help="Title used for the startup performance Rich table.",
+        ),
+    ] = "Viewer startup timings",
+) -> None:
+    """Open an OME-Zarr store in the 2D / 3D toggle viewer."""
+    from oz_viewer.viewer import launch_viewer
+
+    perf_enabled = perf_startup or perf_enabled_from_env()
+    configure_perf_logging(
+        enabled=perf_enabled,
+        log_file=str(perf_log_file) if perf_log_file is not None else None,
+    )
+    perf = StartupPerfTracer(
+        enabled=perf_enabled,
+        show_table=perf_table,
+        table_title=perf_table_title,
+    )
+    perf.mark("cli.view.start", make_example=make_example, theme=theme)
+
+    if make_example:
+        from oz_viewer.data._blobs import make_example_zarr
+
+        zarr_path = make_example_zarr()
+        zarr_uri = f"file://{zarr_path}"
+        perf.mark("cli.view.example_created", zarr_path=zarr_path)
+    else:
+        raw = path or path_option
+        if raw is None:
+            typer.echo(
+                "Error: provide a path as a positional argument, via --path, "
+                "or use --make-example.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if path is not None and path_option is not None:
+            typer.echo(
+                "Error: provide the path as a positional argument or --path, not both.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        zarr_uri = _resolve_zarr_uri(raw)
+        perf.mark("cli.view.uri_resolved", zarr_uri=zarr_uri)
+
+    perf.mark("cli.view.launch")
+    launch_viewer(zarr_uri, theme=theme, perf=perf)
+
+
 @app.command(name="theme")
 def theme_cmd(
     action: Annotated[
