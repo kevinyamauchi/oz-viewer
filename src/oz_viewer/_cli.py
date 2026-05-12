@@ -267,6 +267,18 @@ def view(
             help="Create a synthetic anisotropic OME-Zarr and open it in the viewer.",
         ),
     ] = False,
+    multichannel: Annotated[
+        int | None,
+        typer.Option(
+            "--multichannel",
+            help=(
+                "Dimension index to treat as the channel axis, enabling multichannel"
+                " mode. If omitted, the channel axis is auto-detected from the"
+                " OME-Zarr metadata when present."
+            ),
+            show_default=False,
+        ),
+    ] = None,
     theme: Annotated[
         str,
         typer.Option(
@@ -347,7 +359,7 @@ def view(
         perf.mark("cli.view.uri_resolved", zarr_uri=zarr_uri)
 
     perf.mark("cli.view.launch")
-    launch_viewer(zarr_uri, theme=theme, perf=perf)
+    launch_viewer(zarr_uri, channel_axis=multichannel, theme=theme, perf=perf)
 
 
 @app.command(name="theme")

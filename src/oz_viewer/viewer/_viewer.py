@@ -56,6 +56,8 @@ class _ViewerGeometry(NamedTuple):
     initial_clim_max: float
     clim_range: tuple[float, float]
     slider_decimals: int
+    channel_axis: int | None
+    n_channels: int
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,84 @@ def _perf_mark(perf: StartupPerfTracer | None, step: str, /, **fields: object) -
 
 
 # ---------------------------------------------------------------------------
+# Per-channel control group
+# ---------------------------------------------------------------------------
+
+
+def _build_channel_group(
+    ch_idx: int,
+    ch_appearance,
+    clim_range: tuple[float, float],
+    slider_decimals: int,
+):
+    """Build controls for per-channel visibility, colormap, clim, and opacity."""
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import Qt
+    from superqt import QLabeledDoubleRangeSlider, QLabeledDoubleSlider
+    from superqt.cmap import QColormapComboBox
+
+    group = QtWidgets.QGroupBox(f"Channel {ch_idx}")
+    layout = QtWidgets.QVBoxLayout(group)
+
+    vis_cb = QtWidgets.QCheckBox("Visible")
+    vis_cb.setChecked(ch_appearance.visible)
+    vis_cb.stateChanged.connect(
+        lambda state, _ch=ch_appearance: setattr(_ch, "visible", bool(state))
+    )
+    ch_appearance.events.visible.connect(
+        lambda v, _cb=vis_cb: (
+            _cb.blockSignals(True),
+            _cb.setChecked(v),
+            _cb.blockSignals(False),
+        )
+    )
+    layout.addWidget(vis_cb)
+
+    combo = QColormapComboBox()
+    combo.addColormaps(_DEFAULT_COLORMAPS)
+    combo.setCurrentColormap(ch_appearance.color_map)
+    combo.currentColormapChanged.connect(
+        lambda cmap, _ch=ch_appearance: setattr(_ch, "color_map", cmap)
+    )
+    ch_appearance.events.color_map.connect(lambda v, _c=combo: _c.setCurrentColormap(v))
+    layout.addWidget(combo)
+
+    clim_slider = QLabeledDoubleRangeSlider(Qt.Orientation.Horizontal)
+    clim_slider.setDecimals(slider_decimals)
+    clim_slider.setRange(*clim_range)
+    clim_slider.setValue(ch_appearance.clim)
+    clim_slider.valueChanged.connect(
+        lambda v, _ch=ch_appearance: setattr(_ch, "clim", tuple(v))
+    )
+    ch_appearance.events.clim.connect(
+        lambda v, _s=clim_slider: (
+            _s.blockSignals(True),
+            _s.setValue(v),
+            _s.blockSignals(False),
+        )
+    )
+    layout.addWidget(clim_slider)
+
+    opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
+    opacity_slider.setRange(0.0, 1.0)
+    opacity_slider.setSingleStep(0.05)
+    opacity_slider.setValue(ch_appearance.opacity)
+    opacity_slider.valueChanged.connect(
+        lambda v, _ch=ch_appearance: setattr(_ch, "opacity", v)
+    )
+    ch_appearance.events.opacity.connect(
+        lambda v, _s=opacity_slider: (
+            _s.blockSignals(True),
+            _s.setValue(v),
+            _s.blockSignals(False),
+        )
+    )
+    layout.addWidget(opacity_slider)
+
+    return group
+
+
+# ---------------------------------------------------------------------------
 # Main viewer class
 # ---------------------------------------------------------------------------
 
@@ -97,6 +177,7 @@ class OmeZarrViewer:
         canvas_widget,
         visual_model,
         geometry: _ViewerGeometry,
+        data_store=None,
     ) -> None:
         from cellier.v2.gui.visuals._colormap import QtColormapComboBox
         from cellier.v2.gui.visuals._contrast_limits import QtClimRangeSlider
@@ -109,6 +190,7 @@ class OmeZarrViewer:
         self._canvas_widget = canvas_widget
         self._visual_model = visual_model
         self._geo = geometry
+        self._data_store = data_store
 
         si = geometry.spatial_indices
         # The axis that moves between displayed and sliced on 2D ↔ 3D toggle.
@@ -125,6 +207,18 @@ class OmeZarrViewer:
         self._saved_z: float = (
             float(geometry.initial_slice_indices_2d.get(self._sz0, 0))
             if self._sz0 is not None
+            else 0.0
+        )
+
+        # Multichannel state.
+        self._mode_channel: str = "single"
+        self._mc_visual_id = None
+        self._channel_appearances: dict | None = None
+        self._mc_built: bool = False
+        # Saved channel index to restore when switching back to SC.
+        self._saved_channel: float = (
+            float(geometry.initial_slice_indices_2d.get(geometry.channel_axis, 0))
+            if geometry.channel_axis is not None
             else 0.0
         )
 
@@ -178,13 +272,13 @@ class OmeZarrViewer:
 
         # Side panel on the left.
         panel = QtWidgets.QWidget()
-        panel.setFixedWidth(280)
+        panel.setFixedWidth(300)
         panel_layout = QtWidgets.QVBoxLayout(panel)
         panel_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         root_layout.addWidget(panel)
         root_layout.addWidget(canvas_widget.widget, stretch=1)
 
-        # ── Toggle button ─────────────────────────────────────────────────
+        # ── 2D/3D toggle button ───────────────────────────────────────────
         self._toggle_btn = QtWidgets.QPushButton("Switch to 3D")
         self._toggle_btn.clicked.connect(self._on_toggle_clicked)
         if geometry.spatial_ndim < 3:
@@ -197,19 +291,35 @@ class OmeZarrViewer:
         self._mode_label = QtWidgets.QLabel("Mode: 2D")
         panel_layout.addWidget(self._mode_label)
 
-        # ── Shared: contrast limits ───────────────────────────────────────
+        # ── SC/MC toggle button (only when a channel axis exists) ─────────
+        if geometry.channel_axis is not None:
+            self._toggle_mc_btn = QtWidgets.QPushButton("Switch to Multichannel")
+            self._toggle_mc_btn.clicked.connect(self._on_mc_toggle_clicked)
+            panel_layout.addWidget(self._toggle_mc_btn)
+        else:
+            self._toggle_mc_btn = None
+
+        # ── Outer stacked widget: page 0 = single-channel, page 1 = MC ───
+        self._channel_stack = QStackedWidget()
+        panel_layout.addWidget(self._channel_stack)
+
+        # ── SC page (page 0) ──────────────────────────────────────────────
+        sc_page = QtWidgets.QWidget()
+        sc_layout = QtWidgets.QVBoxLayout(sc_page)
+        sc_layout.setContentsMargins(0, 0, 0, 0)
+        sc_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+
         clim_group = QtWidgets.QGroupBox("Contrast limits")
         QtWidgets.QVBoxLayout(clim_group).addWidget(self._clim_slider.widget)
-        panel_layout.addWidget(clim_group)
+        sc_layout.addWidget(clim_group)
 
-        # ── Shared: colormap ──────────────────────────────────────────────
         cmap_group = QtWidgets.QGroupBox("Colormap")
         QtWidgets.QVBoxLayout(cmap_group).addWidget(self._colormap_combo.widget)
-        panel_layout.addWidget(cmap_group)
+        sc_layout.addWidget(cmap_group)
 
-        # ── Stacked: mode-specific controls ───────────────────────────────
-        self._stack = QStackedWidget()
-        panel_layout.addWidget(self._stack)
+        # Inner stacked widget: 2D/3D mode-specific controls.
+        self._mode_stack = QStackedWidget()
+        sc_layout.addWidget(self._mode_stack)
 
         # Page 0 — 2D controls
         page_2d = QtWidgets.QWidget()
@@ -221,7 +331,7 @@ class OmeZarrViewer:
         self._lod_bias_2d_slider = self._make_lod_slider("2d")
         QtWidgets.QVBoxLayout(lod_2d_group).addWidget(self._lod_bias_2d_slider)
         layout_2d.addWidget(lod_2d_group)
-        self._stack.addWidget(page_2d)
+        self._mode_stack.addWidget(page_2d)
 
         # Page 1 — 3D controls
         page_3d = QtWidgets.QWidget()
@@ -236,9 +346,36 @@ class OmeZarrViewer:
         self._lod_bias_3d_slider = self._make_lod_slider("3d")
         QtWidgets.QVBoxLayout(lod_3d_group).addWidget(self._lod_bias_3d_slider)
         layout_3d.addWidget(lod_3d_group)
-        self._stack.addWidget(page_3d)
+        self._mode_stack.addWidget(page_3d)
 
-        self._stack.setCurrentIndex(0)
+        self._mode_stack.setCurrentIndex(0)
+        self._channel_stack.addWidget(sc_page)
+
+        # ── MC page (page 1) — populated lazily on first toggle ───────────
+        self._mc_page = QtWidgets.QWidget()
+        self._mc_page_layout = QtWidgets.QVBoxLayout(self._mc_page)
+        self._mc_page_layout.setContentsMargins(0, 0, 0, 0)
+        self._mc_page_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self._channel_stack.addWidget(self._mc_page)
+
+        self._channel_stack.setCurrentIndex(0)
+
+        # ── Camera settle threshold ───────────────────────────────────────────
+        settle_group = QtWidgets.QGroupBox("Camera settle (ms)")
+        settle_layout = QtWidgets.QVBoxLayout(settle_group)
+        from PySide6.QtWidgets import QDoubleSpinBox
+
+        self._settle_sb = QDoubleSpinBox()
+        self._settle_sb.setRange(50.0, 2000.0)
+        self._settle_sb.setSingleStep(50.0)
+        self._settle_sb.setDecimals(0)
+        self._settle_sb.setValue(300.0)
+        self._settle_sb.valueChanged.connect(
+            lambda v: setattr(controller, "camera_settle_threshold_s", v / 1000.0)
+        )
+        settle_layout.addWidget(self._settle_sb)
+        panel_layout.addWidget(settle_group)
+
         panel_layout.addStretch()
 
     # ------------------------------------------------------------------
@@ -279,6 +416,12 @@ class OmeZarrViewer:
 
         current_slice = dict(self._scene.dims.selection.slice_indices)
         self._controller.cancel_pending_slices(self._scene.id)
+        in_sc = self._mode_channel == "single"
+        stacked = (
+            (self._geo.channel_axis,)
+            if not in_sc and self._geo.channel_axis is not None
+            else None
+        )
 
         if self._active_mode == "2d":
             # Save the Z world-coord before it leaves slice_indices.
@@ -292,14 +435,15 @@ class OmeZarrViewer:
             # sz0 becomes displayed in 3D — drop it from slice_indices.
             new_slice = {k: v for k, v in current_slice.items() if k != self._sz0}
 
-            # Switch to stored 3D LOD bias.
-            self._lod_bias_2d = self._lod_bias_2d_slider.value()
-            self._controller.update_appearance_field(
-                self._visual_model.id, "lod_bias", self._lod_bias_3d
-            )
-            self._lod_bias_3d_slider.blockSignals(True)
-            self._lod_bias_3d_slider.setValue(self._lod_bias_3d)
-            self._lod_bias_3d_slider.blockSignals(False)
+            # Update LOD bias only when the SC visual is active.
+            if in_sc:
+                self._lod_bias_2d = self._lod_bias_2d_slider.value()
+                self._controller.update_appearance_field(
+                    self._visual_model.id, "lod_bias", self._lod_bias_3d
+                )
+                self._lod_bias_3d_slider.blockSignals(True)
+                self._lod_bias_3d_slider.setValue(self._lod_bias_3d)
+                self._lod_bias_3d_slider.blockSignals(False)
 
             self._controller.incoming_events.emit(
                 DimsUpdateEvent(
@@ -307,13 +451,14 @@ class OmeZarrViewer:
                     scene_id=self._scene.id,
                     slice_indices=new_slice,
                     displayed_axes=self._displayed_axes_3d,
+                    stacked_axes=stacked,
                 )
             )
-
             self._active_mode = "3d"
             self._mode_label.setText("Mode: 3D")
             self._toggle_btn.setText("Switch to 2D")
-            self._stack.setCurrentIndex(1)
+            if in_sc:
+                self._mode_stack.setCurrentIndex(1)
 
         else:
             # Restore sz0 into slice_indices.
@@ -321,14 +466,15 @@ class OmeZarrViewer:
             if self._sz0 is not None:
                 new_slice[self._sz0] = self._saved_z
 
-            # Switch to stored 2D LOD bias.
-            self._lod_bias_3d = self._lod_bias_3d_slider.value()
-            self._controller.update_appearance_field(
-                self._visual_model.id, "lod_bias", self._lod_bias_2d
-            )
-            self._lod_bias_2d_slider.blockSignals(True)
-            self._lod_bias_2d_slider.setValue(self._lod_bias_2d)
-            self._lod_bias_2d_slider.blockSignals(False)
+            # Update LOD bias only when the SC visual is active.
+            if in_sc:
+                self._lod_bias_3d = self._lod_bias_3d_slider.value()
+                self._controller.update_appearance_field(
+                    self._visual_model.id, "lod_bias", self._lod_bias_2d
+                )
+                self._lod_bias_2d_slider.blockSignals(True)
+                self._lod_bias_2d_slider.setValue(self._lod_bias_2d)
+                self._lod_bias_2d_slider.blockSignals(False)
 
             self._controller.incoming_events.emit(
                 DimsUpdateEvent(
@@ -336,12 +482,128 @@ class OmeZarrViewer:
                     scene_id=self._scene.id,
                     slice_indices=new_slice,
                     displayed_axes=self._displayed_axes_2d,
+                    stacked_axes=stacked,
                 )
             )
             self._active_mode = "2d"
             self._mode_label.setText("Mode: 2D")
             self._toggle_btn.setText("Switch to 3D")
-            self._stack.setCurrentIndex(0)
+            if in_sc:
+                self._mode_stack.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------
+    # Multichannel toggle
+    # ------------------------------------------------------------------
+
+    def _on_mc_toggle_clicked(self) -> None:
+        to_mc = self._mode_channel == "single"
+
+        if to_mc:
+            if not self._mc_built:
+                self._build_mc_visual()
+                self._build_mc_page()
+            # Hide SC visual (has .appearance), show each MC channel.
+            self._controller.update_appearance_field(
+                self._visual_model.id, "visible", False
+            )
+            self._set_mc_visible(True)
+            # Move channel axis from slice_indices → stacked_axes so the slider hides.
+            ch = self._geo.channel_axis
+            if ch is not None:
+                current = dict(self._scene.dims.selection.slice_indices)
+                self._saved_channel = float(current.get(ch, self._saved_channel))
+                current.pop(ch, None)
+                self._controller.update_slice_indices(self._scene.id, current)
+                self._controller.update_stacked_axes(self._scene.id, (ch,))
+            self._channel_stack.setCurrentIndex(1)
+            self._mode_channel = "multichannel"
+            if self._toggle_mc_btn is not None:
+                self._toggle_mc_btn.setText("Switch to Single Channel")
+        else:
+            # Hide each MC channel, show SC visual.
+            self._set_mc_visible(False)
+            self._controller.update_appearance_field(
+                self._visual_model.id, "visible", True
+            )
+            # Move channel axis from stacked_axes → slice_indices
+            # so the slider reappears.
+            ch = self._geo.channel_axis
+            if ch is not None:
+                self._controller.update_stacked_axes(self._scene.id, ())
+                current = dict(self._scene.dims.selection.slice_indices)
+                current[ch] = self._saved_channel
+                self._controller.update_slice_indices(self._scene.id, current)
+            self._channel_stack.setCurrentIndex(0)
+            # Sync the 2D/3D inner stack to the current active mode — it
+            # was not updated while _channel_stack was on the MC page.
+            self._mode_stack.setCurrentIndex(0 if self._active_mode == "2d" else 1)
+            self._mode_channel = "single"
+            if self._toggle_mc_btn is not None:
+                self._toggle_mc_btn.setText("Switch to Multichannel")
+
+    def _set_mc_visible(self, visible: bool) -> None:
+        """Set visible on every ChannelAppearance of the MC visual."""
+        mc_model = self._controller.get_visual_model(self._mc_visual_id)
+        for ch in mc_model.channels.values():
+            ch.visible = visible
+
+    def _build_mc_visual(self) -> None:
+        from cellier.v2.visuals._channel_appearance import ChannelAppearance
+        from cellier.v2.visuals._image import MultiscaleImageRenderConfig
+
+        geo = self._geo
+        channel_appearances = {
+            i: ChannelAppearance(
+                color_map=_DEFAULT_COLORMAPS[i % len(_DEFAULT_COLORMAPS)],
+                clim=(0.0, geo.initial_clim_max),
+                visible=False,
+            )
+            for i in range(geo.n_channels)
+        }
+        render_config = MultiscaleImageRenderConfig(
+            block_size=32,
+            gpu_budget_bytes=512 * 1024**2,
+            gpu_budget_bytes_2d=64 * 1024**2,
+        )
+        mc_visual = self._controller.add_multichannel_image_multiscale(
+            data=self._data_store,
+            scene_id=self._scene.id,
+            channel_axis=geo.channel_axis,
+            channels=channel_appearances,
+            name="multichannel_volume",
+            render_config=render_config,
+            transform=geo.voxel_to_world,
+        )
+        self._mc_visual_id = mc_visual.id
+        self._channel_appearances = channel_appearances
+        self._mc_built = True
+
+    def _build_mc_page(self) -> None:
+        from PySide6 import QtWidgets
+        from PySide6.QtCore import Qt
+
+        geo = self._geo
+        n = geo.n_channels
+
+        if n > 3:
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            container = QtWidgets.QWidget()
+            container_layout = QtWidgets.QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            for i, ch in self._channel_appearances.items():
+                container_layout.addWidget(
+                    _build_channel_group(i, ch, geo.clim_range, geo.slider_decimals)
+                )
+            scroll.setWidget(container)
+            self._mc_page_layout.addWidget(scroll)
+        else:
+            for i, ch in self._channel_appearances.items():
+                self._mc_page_layout.addWidget(
+                    _build_channel_group(i, ch, geo.clim_range, geo.slider_decimals)
+                )
 
     # ------------------------------------------------------------------
 
@@ -364,6 +626,7 @@ class OmeZarrViewer:
 def build_viewer_model(
     zarr_uri: str,
     *,
+    channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
 ) -> tuple:
     """Build a ViewerModel for the viewer without constructing any Qt objects.
@@ -372,6 +635,9 @@ def build_viewer_model(
     ----------
     zarr_uri : str
         Path or URI to the OME-Zarr store.
+    channel_axis : int or None, optional
+        Axis index to treat as the channel dimension.  When ``None`` (default),
+        the channel axis is auto-detected from the OME-Zarr axis metadata.
     perf : StartupPerfTracer | None, optional
         Optional startup performance tracer.
 
@@ -414,12 +680,16 @@ def build_viewer_model(
 
     n_dims = len(data_store.level_shapes[0])
 
-    # Detect channel axis from OME-Zarr axis metadata.
-    channel_axis: int | None = None
-    for idx, ax in enumerate(ms.axes):
-        if getattr(ax, "type", None) == "channel":
-            channel_axis = idx
-            break
+    # Detect channel axis from OME-Zarr axis metadata when not explicitly set.
+    if channel_axis is None:
+        effective_channel_axis: int | None = None
+        for idx, ax in enumerate(ms.axes):
+            if getattr(ax, "type", None) == "channel":
+                effective_channel_axis = idx
+                break
+    else:
+        effective_channel_axis = channel_axis
+    channel_axis = effective_channel_axis
 
     spatial_indices: list[int] = [i for i in range(n_dims) if i != channel_axis]
     spatial_ndim = len(spatial_indices)
@@ -475,6 +745,9 @@ def build_viewer_model(
 
     initial_clim_max = _dtype_clim_max(data_store.dtype)
     slider_decimals = _dtype_decimals(data_store.dtype)
+    n_channels = (
+        int(data_store.level_shapes[0][channel_axis]) if channel_axis is not None else 0
+    )
 
     # axis_ranges covers all axes; dims sliders appear for non-displayed axes.
     axis_ranges = {i: (0.0, round(float(world_max_full[i]))) for i in range(n_dims)}
@@ -504,9 +777,9 @@ def build_viewer_model(
         data_store_id=str(data_store.id),
         level_transforms=data_store.level_transforms,
         appearance=MultiscaleImageAppearance(
-            color_map="grays",
+            color_map="viridis",
             clim=(0.0, initial_clim_max),
-            lod_bias=1.0,
+            lod_bias=1.5,
             force_level=None,
             frustum_cull=True,
             iso_threshold=initial_clim_max / 2.0,
@@ -573,6 +846,8 @@ def build_viewer_model(
         initial_clim_max=initial_clim_max,
         clim_range=(0.0, initial_clim_max),
         slider_decimals=slider_decimals,
+        channel_axis=channel_axis,
+        n_channels=n_channels,
     )
     return viewer_model, geometry
 
@@ -663,6 +938,7 @@ async def _run_viewer_async(
     zarr_uri: str,
     theme: str = "dark",
     *,
+    channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
 ) -> None:
     import asyncio as _asyncio
@@ -672,7 +948,9 @@ async def _run_viewer_async(
     _asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
     _perf_mark(perf, "viewer.async.start", theme=theme)
 
-    v = _build_and_show_viewer(zarr_uri, theme=theme, perf=perf)
+    v = _build_and_show_viewer(
+        zarr_uri, theme=theme, channel_axis=channel_axis, perf=perf
+    )
     _perf_mark(perf, "viewer.async.build_complete")
 
     app = QApplication.instance()
@@ -691,6 +969,7 @@ def launch_viewer(
     zarr_uri: str,
     theme: str = "dark",
     *,
+    channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
 ) -> None:
     """Open a viewer window and block until it is closed.
@@ -706,6 +985,9 @@ def launch_viewer(
     theme : str
         Registered theme name. Defaults to ``"dark"``.
         Use ``oz_viewer.theme.list_themes()`` to see available themes.
+    channel_axis : int or None, optional
+        Axis index to treat as the channel dimension.  When ``None`` (default),
+        the channel axis is auto-detected from the OME-Zarr axis metadata.
     perf : StartupPerfTracer | None, optional
         Optional startup performance tracer.
     """
@@ -721,7 +1003,7 @@ def launch_viewer(
     app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
     _perf_mark(perf, "viewer.launch.qapp_ready")
     QtAsyncio.run(
-        _run_viewer_async(zarr_uri, theme=theme, perf=perf),
+        _run_viewer_async(zarr_uri, theme=theme, channel_axis=channel_axis, perf=perf),
         handle_sigint=True,
     )
 
@@ -735,6 +1017,7 @@ def _build_and_show_viewer(
     zarr_uri: str,
     theme: str = "dark",
     *,
+    channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
 ) -> OmeZarrViewer:
     """Build the full viewer from a zarr URI and show the window."""
@@ -754,8 +1037,11 @@ def _build_and_show_viewer(
         TemporalAccumulationConfig,
     )
 
-    viewer_model, geometry = build_viewer_model(zarr_uri, perf=perf)
+    viewer_model, geometry = build_viewer_model(
+        zarr_uri, channel_axis=channel_axis, perf=perf
+    )
     _perf_mark(perf, "viewer.build.model_ready")
+    data_store = next(iter(viewer_model.data.stores.values()))
 
     controller = CellierController.from_model(
         viewer_model,
@@ -766,6 +1052,9 @@ def _build_and_show_viewer(
         widget_parent=None,
     )
     _perf_mark(perf, "viewer.build.controller_ready")
+
+    controller.camera_reslice_enabled = True
+    controller.camera_settle_threshold_s = 0.3
 
     scene = controller.get_scene_by_name("main")
     visual_model = next(iter(scene.visuals))
@@ -787,6 +1076,7 @@ def _build_and_show_viewer(
         canvas_widget=canvas_widget,
         visual_model=visual_model,
         geometry=geometry,
+        data_store=data_store,
     )
 
     # Perf: track time to first paint.
