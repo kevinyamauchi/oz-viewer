@@ -14,6 +14,21 @@ if TYPE_CHECKING:
 
     from oz_viewer._perf import StartupPerfTracer
 
+from oz_viewer.viewer._utils import (
+    _asyncio_exception_handler,
+    _dtype_clim_max,
+    _dtype_decimals,
+    _ensure_qt_app,
+    _perf_mark,
+)
+from oz_viewer.viewer._widgets import (
+    _DEFAULT_COLORMAPS,
+    _MultiVisualClimSlider,
+    _MultiVisualColormapCombo,
+    _MultiVisualLodBiasSlider,
+    build_channel_list_widget,
+)
+
 # ---------------------------------------------------------------------------
 # Slider color styles for each 2D panel
 # ---------------------------------------------------------------------------
@@ -106,31 +121,6 @@ class _WorldGeometry(NamedTuple):
     clim_range: tuple[float, float]
     slider_decimals: int
     n_channels: int
-
-
-_DEFAULT_COLORMAPS: list[str] = [
-    "viridis",
-    "plasma",
-    "white",
-    "green",
-    "blue",
-    "red",
-    "magenta",
-    "cyan",
-    "bop_blue",
-    "bop_orange",
-    "bop_purple",
-    "i_blue",
-    "i_bordeaux",
-    "i_cyan",
-    "i_forest",
-    "i_green",
-    "i_magenta",
-    "i_orange",
-    "i_purple",
-    "i_red",
-    "i_yellow",
-]
 
 
 @dataclass
@@ -296,226 +286,6 @@ class _VolTransparencyManager:
     def update_opacity(self, opacity: float) -> None:
         self.current_profile.opacity = opacity
         self.apply()
-
-
-# ---------------------------------------------------------------------------
-# Multi-visual control helpers
-# ---------------------------------------------------------------------------
-
-
-class _MultiVisualClimSlider:
-    """Contrast-limits range slider that updates multiple visuals at once."""
-
-    from psygnal import Signal
-
-    changed = Signal(object)
-    closed = Signal()
-
-    def __init__(
-        self,
-        visual_ids: list,
-        *,
-        clim_range: tuple[float, float],
-        initial_clim: tuple[float, float],
-        decimals: int = 2,
-        parent=None,
-    ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
-        from qtpy.QtCore import Qt
-        from superqt import QLabeledDoubleRangeSlider
-
-        self._id = uuid4()
-        self._visual_ids = visual_ids
-        self._AppearanceUpdateEvent = AppearanceUpdateEvent
-
-        self._slider = QLabeledDoubleRangeSlider(Qt.Orientation.Horizontal, parent)
-        self._slider.setRange(*clim_range)
-        self._slider.setValue(initial_clim)
-        self._slider.setDecimals(decimals)
-        self._slider.valueChanged.connect(self._on_changed)
-
-    def _on_changed(self, value: tuple[float, float]) -> None:
-        for vid in self._visual_ids:
-            self.changed.emit(
-                self._AppearanceUpdateEvent(
-                    source_id=self._id,
-                    visual_id=vid,
-                    field="clim",
-                    value=value,
-                )
-            )
-
-    def _on_visual_changed(self, event) -> None:
-        if event.source_id == self._id:
-            return
-        if event.field_name != "clim":
-            return
-        self._slider.blockSignals(True)
-        self._slider.setValue(event.new_value)
-        self._slider.blockSignals(False)
-
-    def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
-
-        if not self._visual_ids:
-            return []
-        return [
-            SubscriptionSpec(
-                event_type=AppearanceChangedEvent,
-                handler=self._on_visual_changed,
-                entity_id=self._visual_ids[0],
-            )
-        ]
-
-    @property
-    def widget(self):
-        return self._slider
-
-    def close(self) -> None:
-        self.closed.emit()
-
-
-class _MultiVisualColormapCombo:
-    """Colormap combo box that updates multiple visuals at once."""
-
-    from psygnal import Signal
-
-    changed = Signal(object)
-    closed = Signal()
-
-    def __init__(
-        self,
-        visual_ids: list,
-        *,
-        initial_colormap,
-        parent=None,
-    ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
-        from superqt import QColormapComboBox
-
-        self._id = uuid4()
-        self._visual_ids = visual_ids
-        self._AppearanceUpdateEvent = AppearanceUpdateEvent
-
-        self._combo = QColormapComboBox(parent)
-        self._combo.addColormaps(_DEFAULT_COLORMAPS)
-        self._combo.setCurrentColormap(initial_colormap)
-        self._combo.currentColormapChanged.connect(self._on_changed)
-
-    def _on_changed(self, colormap) -> None:
-        for vid in self._visual_ids:
-            self.changed.emit(
-                self._AppearanceUpdateEvent(
-                    source_id=self._id,
-                    visual_id=vid,
-                    field="color_map",
-                    value=colormap,
-                )
-            )
-
-    def _on_visual_changed(self, event) -> None:
-        if event.source_id == self._id:
-            return
-        if event.field_name != "color_map":
-            return
-        self._combo.blockSignals(True)
-        self._combo.setCurrentColormap(event.new_value)
-        self._combo.blockSignals(False)
-
-    def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
-
-        if not self._visual_ids:
-            return []
-        return [
-            SubscriptionSpec(
-                event_type=AppearanceChangedEvent,
-                handler=self._on_visual_changed,
-                entity_id=self._visual_ids[0],
-            )
-        ]
-
-    @property
-    def widget(self):
-        return self._combo
-
-    def close(self) -> None:
-        self.closed.emit()
-
-
-class _MultiVisualLodBiasSlider:
-    """LOD-bias slider that updates multiple visuals at once."""
-
-    from psygnal import Signal
-
-    changed = Signal(object)
-    closed = Signal()
-
-    def __init__(
-        self,
-        visual_ids: list,
-        *,
-        initial_lod_bias: float = 1.0,
-        lod_range: tuple[float, float] = (1e-6, 5.0),
-        decimals: int = 2,
-        parent=None,
-    ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
-        from qtpy.QtCore import Qt
-        from superqt import QLabeledDoubleSlider
-
-        self._id = uuid4()
-        self._visual_ids = visual_ids
-        self._AppearanceUpdateEvent = AppearanceUpdateEvent
-
-        self._slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal, parent)
-        self._slider.setRange(*lod_range)
-        self._slider.setDecimals(decimals)
-        self._slider.setValue(initial_lod_bias)
-
-        # Fire only on release to avoid a reslice on every drag tick.
-        self._slider.sliderReleased.connect(self._on_released)
-
-    def _on_released(self) -> None:
-        value = self._slider.value()
-        for vid in self._visual_ids:
-            self.changed.emit(
-                self._AppearanceUpdateEvent(
-                    source_id=self._id,
-                    visual_id=vid,
-                    field="lod_bias",
-                    value=value,
-                )
-            )
-
-    def _on_visual_changed(self, event) -> None:
-        if event.source_id == self._id:
-            return
-        if event.field_name != "lod_bias":
-            return
-        self._slider.blockSignals(True)
-        self._slider.setValue(event.new_value)
-        self._slider.blockSignals(False)
-
-    def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
-
-        if not self._visual_ids:
-            return []
-        return [
-            SubscriptionSpec(
-                event_type=AppearanceChangedEvent,
-                handler=self._on_visual_changed,
-                entity_id=self._visual_ids[0],
-            )
-        ]
-
-    @property
-    def widget(self):
-        return self._slider
-
-    def close(self) -> None:
-        self.closed.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -876,8 +646,11 @@ class OmeZarrOrthoViewer:
         from PySide6.QtCore import Qt as _Qt
 
         mc_page_layout.setAlignment(_Qt.AlignmentFlag.AlignTop)
-        for i, ch in self._channel_appearances.items():
-            mc_page_layout.addWidget(self._build_channel_group(i, ch))
+        mc_page_layout.addWidget(
+            build_channel_list_widget(
+                self._channel_appearances, self._clim_range, self._slider_decimals
+            )
+        )
         if self._spatial_ndim == 3:
             mc_page_layout.addWidget(self._build_mc_3d_group())
         mc_page_layout.addStretch()
@@ -968,7 +741,7 @@ class OmeZarrOrthoViewer:
 
         self._channel_appearances = {
             i: ChannelAppearance(
-                colormap=colormaps[i % len(colormaps)],
+                color_map=colormaps[i % len(colormaps)],
                 clim=(0.0, initial_clim_max),
             )
             for i in range(self._n_channels)
@@ -1165,78 +938,6 @@ class OmeZarrOrthoViewer:
             plane_slider.valueChanged.connect(_on_plane_opacity)
             plane_layout.addWidget(plane_slider)
             layout.addWidget(plane_box)
-
-        return group
-
-    def _build_channel_group(self, ch_idx: int, ch_appearance) -> QtWidgets.QGroupBox:
-        from PySide6 import QtWidgets
-        from PySide6.QtCore import Qt
-        from superqt import QLabeledDoubleRangeSlider, QLabeledDoubleSlider
-        from superqt.cmap import QColormapComboBox
-
-        group = QtWidgets.QGroupBox(f"Channel {ch_idx}")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        # Visibility
-        vis_cb = QtWidgets.QCheckBox("Visible")
-        vis_cb.setChecked(ch_appearance.visible)
-        vis_cb.stateChanged.connect(
-            lambda state, _ch=ch_appearance: setattr(_ch, "visible", bool(state))
-        )
-        ch_appearance.events.visible.connect(
-            lambda v, _cb=vis_cb: (
-                _cb.blockSignals(True),
-                _cb.setChecked(v),
-                _cb.blockSignals(False),
-            )
-        )
-        layout.addWidget(vis_cb)
-
-        # Colormap
-        combo = QColormapComboBox()
-        combo.addColormaps(_DEFAULT_COLORMAPS)
-        combo.setCurrentColormap(ch_appearance.colormap)
-        combo.currentColormapChanged.connect(
-            lambda cmap, _ch=ch_appearance: setattr(_ch, "colormap", cmap)
-        )
-        ch_appearance.events.colormap.connect(
-            lambda v, _c=combo: _c.setCurrentColormap(v)
-        )
-        layout.addWidget(combo)
-
-        # Contrast limits
-        clim_slider = QLabeledDoubleRangeSlider(Qt.Orientation.Horizontal)
-        clim_slider.setDecimals(self._slider_decimals)
-        clim_slider.setRange(*self._clim_range)
-        clim_slider.setValue(ch_appearance.clim)
-        clim_slider.valueChanged.connect(
-            lambda v, _ch=ch_appearance: setattr(_ch, "clim", tuple(v))
-        )
-        ch_appearance.events.clim.connect(
-            lambda v, _s=clim_slider: (
-                _s.blockSignals(True),
-                _s.setValue(v),
-                _s.blockSignals(False),
-            )
-        )
-        layout.addWidget(clim_slider)
-
-        # Opacity
-        opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
-        opacity_slider.setRange(0.0, 1.0)
-        opacity_slider.setSingleStep(0.05)
-        opacity_slider.setValue(ch_appearance.opacity)
-        opacity_slider.valueChanged.connect(
-            lambda v, _ch=ch_appearance: setattr(_ch, "opacity", v)
-        )
-        ch_appearance.events.opacity.connect(
-            lambda v, _s=opacity_slider: (
-                _s.blockSignals(True),
-                _s.setValue(v),
-                _s.blockSignals(False),
-            )
-        )
-        layout.addWidget(opacity_slider)
 
         return group
 
@@ -1863,31 +1564,6 @@ class _ChannelAxisSyncer:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _dtype_clim_max(dtype: np.dtype) -> float:
-    if np.issubdtype(dtype, np.integer):
-        return float(np.iinfo(dtype).max)
-    return 1.0
-
-
-def _dtype_decimals(dtype: np.dtype) -> int:
-    return 0 if np.issubdtype(dtype, np.integer) else 2
-
-
-def _perf_mark(
-    perf: StartupPerfTracer | None,
-    step: str,
-    /,
-    **fields: object,
-) -> None:
-    if perf is not None:
-        perf.mark(step, **fields)
-
-
-# ---------------------------------------------------------------------------
 # Layer 1: ViewerModel builder
 # ---------------------------------------------------------------------------
 
@@ -2269,33 +1945,8 @@ def build_ortho_viewer_model(
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Qt bootstrap helper
+# Layer 2: Qt bootstrap helper  (imported from _utils)
 # ---------------------------------------------------------------------------
-
-
-def _ensure_qt_app():
-    """Return the active QApplication, creating one via IPython if needed.
-
-    Returns None if not in an interactive environment and no QApplication
-    exists — callers should raise a useful error in that case.
-    """
-    from PySide6.QtWidgets import QApplication
-
-    if app := QApplication.instance():
-        return app
-
-    try:
-        import IPython
-
-        ip = IPython.get_ipython()
-        if ip is not None:
-            ip.enable_gui("qt6")
-            return QApplication.instance()
-    except ImportError:
-        pass
-
-    return None
-
 
 # ---------------------------------------------------------------------------
 # Layer 3: Non-blocking show (for interactive / Jupyter use)
@@ -2343,35 +1994,6 @@ def orthoviewer(
 # ---------------------------------------------------------------------------
 # Layer 4: Private async core
 # ---------------------------------------------------------------------------
-
-
-def _asyncio_exception_handler(context: dict) -> None:
-    """Custom asyncio exception handler that works around two PySide6 bugs.
-
-    Bug 1: PySide6's default_exception_handler unconditionally accesses
-    context['task'], but the asyncio spec makes 'task' optional, causing a
-    KeyError that swallows the original exception message.
-
-    Bug 2: PySide6's QtAsyncio routes CancelledError to the exception handler
-    instead of letting it propagate as normal task cancellation. CancelledError
-    is how cellier cancels stale chunk fetches when the slice position changes —
-    it is expected and should be silently ignored.
-    """
-    import traceback
-
-    exc = context.get("exception")
-    if isinstance(exc, asyncio.CancelledError):
-        return
-
-    msg = context.get("message", "unhandled exception in asyncio")
-    task = context.get("task")
-    handle = context.get("handle")
-    source = (
-        f"task {task._name}" if task else (repr(handle) if handle else "unknown source")
-    )
-    print(f"[asyncio] {msg} from {source}")
-    if exc is not None:
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 async def _run_orthoviewer_async(
@@ -2552,7 +2174,7 @@ def _build_and_show(
         colormaps = _DEFAULT_COLORMAPS
         initial_channel_appearances = {
             i: ChannelAppearance(
-                colormap=colormaps[i % len(colormaps)],
+                color_map=colormaps[i % len(colormaps)],
                 clim=(0.0, initial_clim_max),
             )
             for i in range(n_channels)

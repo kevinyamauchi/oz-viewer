@@ -10,31 +10,17 @@ import numpy as np
 if TYPE_CHECKING:
     from oz_viewer._perf import StartupPerfTracer
 
-_DEFAULT_COLORMAPS: list[str] = [
-    "viridis",
-    "plasma",
-    "grays",
-    "white",
-    "green",
-    "blue",
-    "red",
-    "magenta",
-    "cyan",
-    "bop_blue",
-    "bop_orange",
-    "bop_purple",
-    "i_blue",
-    "i_bordeaux",
-    "i_cyan",
-    "i_forest",
-    "i_green",
-    "i_magenta",
-    "i_orange",
-    "i_purple",
-    "i_red",
-    "i_yellow",
-]
-
+from oz_viewer.viewer._utils import (
+    _asyncio_exception_handler,
+    _dtype_clim_max,
+    _dtype_decimals,
+    _ensure_qt_app,
+    _perf_mark,
+)
+from oz_viewer.viewer._widgets import (
+    _DEFAULT_COLORMAPS,
+    build_channel_list_widget,
+)
 
 # ---------------------------------------------------------------------------
 # Geometry descriptor
@@ -58,104 +44,6 @@ class _ViewerGeometry(NamedTuple):
     slider_decimals: int
     channel_axis: int | None
     n_channels: int
-
-
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
-
-def _dtype_clim_max(dtype: np.dtype) -> float:
-    if np.issubdtype(dtype, np.integer):
-        return float(np.iinfo(dtype).max)
-    return 1.0
-
-
-def _dtype_decimals(dtype: np.dtype) -> int:
-    return 0 if np.issubdtype(dtype, np.integer) else 2
-
-
-def _perf_mark(perf: StartupPerfTracer | None, step: str, /, **fields: object) -> None:
-    if perf is not None:
-        perf.mark(step, **fields)
-
-
-# ---------------------------------------------------------------------------
-# Per-channel control group
-# ---------------------------------------------------------------------------
-
-
-def _build_channel_group(
-    ch_idx: int,
-    ch_appearance,
-    clim_range: tuple[float, float],
-    slider_decimals: int,
-):
-    """Build controls for per-channel visibility, colormap, clim, and opacity."""
-    from PySide6 import QtWidgets
-    from PySide6.QtCore import Qt
-    from superqt import QLabeledDoubleRangeSlider, QLabeledDoubleSlider
-    from superqt.cmap import QColormapComboBox
-
-    group = QtWidgets.QGroupBox(f"Channel {ch_idx}")
-    layout = QtWidgets.QVBoxLayout(group)
-
-    vis_cb = QtWidgets.QCheckBox("Visible")
-    vis_cb.setChecked(ch_appearance.visible)
-    vis_cb.stateChanged.connect(
-        lambda state, _ch=ch_appearance: setattr(_ch, "visible", bool(state))
-    )
-    ch_appearance.events.visible.connect(
-        lambda v, _cb=vis_cb: (
-            _cb.blockSignals(True),
-            _cb.setChecked(v),
-            _cb.blockSignals(False),
-        )
-    )
-    layout.addWidget(vis_cb)
-
-    combo = QColormapComboBox()
-    combo.addColormaps(_DEFAULT_COLORMAPS)
-    combo.setCurrentColormap(ch_appearance.color_map)
-    combo.currentColormapChanged.connect(
-        lambda cmap, _ch=ch_appearance: setattr(_ch, "color_map", cmap)
-    )
-    ch_appearance.events.color_map.connect(lambda v, _c=combo: _c.setCurrentColormap(v))
-    layout.addWidget(combo)
-
-    clim_slider = QLabeledDoubleRangeSlider(Qt.Orientation.Horizontal)
-    clim_slider.setDecimals(slider_decimals)
-    clim_slider.setRange(*clim_range)
-    clim_slider.setValue(ch_appearance.clim)
-    clim_slider.valueChanged.connect(
-        lambda v, _ch=ch_appearance: setattr(_ch, "clim", tuple(v))
-    )
-    ch_appearance.events.clim.connect(
-        lambda v, _s=clim_slider: (
-            _s.blockSignals(True),
-            _s.setValue(v),
-            _s.blockSignals(False),
-        )
-    )
-    layout.addWidget(clim_slider)
-
-    opacity_slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
-    opacity_slider.setRange(0.0, 1.0)
-    opacity_slider.setSingleStep(0.05)
-    opacity_slider.setValue(ch_appearance.opacity)
-    opacity_slider.valueChanged.connect(
-        lambda v, _ch=ch_appearance: setattr(_ch, "opacity", v)
-    )
-    ch_appearance.events.opacity.connect(
-        lambda v, _s=opacity_slider: (
-            _s.blockSignals(True),
-            _s.setValue(v),
-            _s.blockSignals(False),
-        )
-    )
-    layout.addWidget(opacity_slider)
-
-    return group
 
 
 # ---------------------------------------------------------------------------
@@ -579,31 +467,12 @@ class OmeZarrViewer:
         self._mc_built = True
 
     def _build_mc_page(self) -> None:
-        from PySide6 import QtWidgets
-        from PySide6.QtCore import Qt
-
         geo = self._geo
-        n = geo.n_channels
-
-        if n > 3:
-            scroll = QtWidgets.QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            container = QtWidgets.QWidget()
-            container_layout = QtWidgets.QVBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-            for i, ch in self._channel_appearances.items():
-                container_layout.addWidget(
-                    _build_channel_group(i, ch, geo.clim_range, geo.slider_decimals)
-                )
-            scroll.setWidget(container)
-            self._mc_page_layout.addWidget(scroll)
-        else:
-            for i, ch in self._channel_appearances.items():
-                self._mc_page_layout.addWidget(
-                    _build_channel_group(i, ch, geo.clim_range, geo.slider_decimals)
-                )
+        self._mc_page_layout.addWidget(
+            build_channel_list_widget(
+                self._channel_appearances, geo.clim_range, geo.slider_decimals
+            )
+        )
 
     # ------------------------------------------------------------------
 
@@ -853,26 +722,8 @@ def build_viewer_model(
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Qt bootstrap helper
+# Layer 2: Qt bootstrap helper  (imported from _utils)
 # ---------------------------------------------------------------------------
-
-
-def _ensure_qt_app():
-    from PySide6.QtWidgets import QApplication
-
-    if app := QApplication.instance():
-        return app
-    try:
-        import IPython
-
-        ip = IPython.get_ipython()
-        if ip is not None:
-            ip.enable_gui("qt6")
-            return QApplication.instance()
-    except ImportError:
-        pass
-    return None
-
 
 # ---------------------------------------------------------------------------
 # Layer 3: Non-blocking show (interactive / Jupyter)
@@ -914,24 +765,6 @@ def viewer(
 # ---------------------------------------------------------------------------
 # Layer 4: Private async core
 # ---------------------------------------------------------------------------
-
-
-def _asyncio_exception_handler(context: dict) -> None:
-    import traceback
-
-    exc = context.get("exception")
-    if isinstance(exc, asyncio.CancelledError):
-        return
-
-    msg = context.get("message", "unhandled exception in asyncio")
-    task = context.get("task")
-    handle = context.get("handle")
-    source = (
-        f"task {task._name}" if task else (repr(handle) if handle else "unknown source")
-    )
-    print(f"[asyncio] {msg} from {source}")
-    if exc is not None:
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 async def _run_viewer_async(
