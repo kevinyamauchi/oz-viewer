@@ -300,16 +300,9 @@ class OmeZarrViewer:
     # ------------------------------------------------------------------
 
     def _on_toggle_clicked(self) -> None:
-        from cellier.v2.events import DimsUpdateEvent
-
         current_slice = dict(self._scene.dims.selection.slice_indices)
         self._controller.cancel_pending_slices(self._scene.id)
         in_sc = self._mode_channel == "single"
-        stacked = (
-            (self._geo.channel_axis,)
-            if not in_sc and self._geo.channel_axis is not None
-            else None
-        )
 
         if self._active_mode == "2d":
             # Save the Z world-coord before it leaves slice_indices.
@@ -333,15 +326,8 @@ class OmeZarrViewer:
                 self._lod_bias_3d_slider.setValue(self._lod_bias_3d)
                 self._lod_bias_3d_slider.blockSignals(False)
 
-            self._controller.incoming_events.emit(
-                DimsUpdateEvent(
-                    source_id=self._controller._id,
-                    scene_id=self._scene.id,
-                    slice_indices=new_slice,
-                    displayed_axes=self._displayed_axes_3d,
-                    stacked_axes=stacked,
-                )
-            )
+            self._controller.update_slice_indices(self._scene.id, new_slice)
+            self._controller.set_displayed_axes(self._scene.id, self._displayed_axes_3d)
             self._active_mode = "3d"
             self._mode_label.setText("Mode: 3D")
             self._toggle_btn.setText("Switch to 2D")
@@ -364,15 +350,8 @@ class OmeZarrViewer:
                 self._lod_bias_2d_slider.setValue(self._lod_bias_2d)
                 self._lod_bias_2d_slider.blockSignals(False)
 
-            self._controller.incoming_events.emit(
-                DimsUpdateEvent(
-                    source_id=self._controller._id,
-                    scene_id=self._scene.id,
-                    slice_indices=new_slice,
-                    displayed_axes=self._displayed_axes_2d,
-                    stacked_axes=stacked,
-                )
-            )
+            self._controller.update_slice_indices(self._scene.id, new_slice)
+            self._controller.set_displayed_axes(self._scene.id, self._displayed_axes_2d)
             self._active_mode = "2d"
             self._mode_label.setText("Mode: 2D")
             self._toggle_btn.setText("Switch to 3D")
@@ -402,7 +381,7 @@ class OmeZarrViewer:
                 self._saved_channel = float(current.get(ch, self._saved_channel))
                 current.pop(ch, None)
                 self._controller.update_slice_indices(self._scene.id, current)
-                self._controller.update_stacked_axes(self._scene.id, (ch,))
+                self._controller.set_stacked_axes(self._scene.id, (ch,))
             self._channel_stack.setCurrentIndex(1)
             self._mode_channel = "multichannel"
             if self._toggle_mc_btn is not None:
@@ -417,7 +396,7 @@ class OmeZarrViewer:
             # so the slider reappears.
             ch = self._geo.channel_axis
             if ch is not None:
-                self._controller.update_stacked_axes(self._scene.id, ())
+                self._controller.set_stacked_axes(self._scene.id, ())
                 current = dict(self._scene.dims.selection.slice_indices)
                 current[ch] = self._saved_channel
                 self._controller.update_slice_indices(self._scene.id, current)

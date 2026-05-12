@@ -683,9 +683,7 @@ class OmeZarrOrthoViewer:
         # Toggle multichannel visual visibility.
         if self._multichannel_visual_ids:
             for vid in self._multichannel_visual_ids:
-                self._controller.update_appearance_field(
-                    vid, "visible", to_multichannel
-                )
+                self._controller.set_visual_visible(vid, to_multichannel)
 
         # Update scene dims to add/remove the channel axis from slice_indices.
         if self._channel_axis is not None:
@@ -768,7 +766,8 @@ class OmeZarrOrthoViewer:
                 transform=self._voxel_to_world,
             )
             # Hide immediately; the toggle will show it.
-            self._controller.update_appearance_field(mc_visual.id, "visible", False)
+            for ch in mc_visual.channels.values():
+                ch.visible = False
             self._multichannel_visual_ids.append(mc_visual.id)
             if key == "vol":
                 _lazy_mc_vol_visual_id = mc_visual.id
