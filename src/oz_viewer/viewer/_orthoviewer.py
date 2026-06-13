@@ -450,9 +450,11 @@ class OmeZarrOrthoViewer:
 
     def _init_sc_controls(self) -> None:
         """Create and connect single-channel slider/combo widgets."""
-        from cellier.v2.gui.visuals._colormap import QtColormapComboBox
-        from cellier.v2.gui.visuals._contrast_limits import QtClimRangeSlider
-        from cellier.v2.gui.visuals._image import QtVolumeRenderControls
+        from cellier.gui.visuals import (
+            QtClimRangeSlider,
+            QtColormapComboBox,
+            QtVolumeRenderControls,
+        )
 
         visuals = self._visuals
         controller = self._controller
@@ -731,8 +733,7 @@ class OmeZarrOrthoViewer:
     # ------------------------------------------------------------------
 
     def _build_multichannel(self) -> None:
-        from cellier.v2.visuals._channel_appearance import ChannelAppearance
-        from cellier.v2.visuals._image import MultiscaleImageRenderConfig
+        from cellier.visuals import ChannelAppearance, MultiscaleImageRenderConfig
 
         initial_clim_max = self._clim_range[1]
         colormaps = _DEFAULT_COLORMAPS
@@ -793,7 +794,7 @@ class OmeZarrOrthoViewer:
 
     def _build_single_channel(self) -> None:
         """Hot-add SC visuals and build the page-0 controls panel."""
-        from cellier.v2.visuals._image import (
+        from cellier.visuals import (
             MultiscaleImageAppearance,
             MultiscaleImageRenderConfig,
         )
@@ -1128,9 +1129,9 @@ def _make_axis_meshes(
     spatial_axes: tuple[int, int, int],
     n_dims: int,
 ) -> tuple:
-    from cellier.v2.data.mesh._mesh_memory_store import MeshMemoryStore
-    from cellier.v2.transform import AffineTransform
-    from cellier.v2.visuals._mesh_memory import MeshFlatAppearance
+    from cellier.data.mesh import MeshMemoryStore
+    from cellier.transform import AffineTransform
+    from cellier.visuals import MeshFlatAppearance
 
     color_z = _PLANE_COLOR_XY
     color_y = _PLANE_COLOR_XZ
@@ -1251,8 +1252,8 @@ def _make_plane_mesh(
     spatial_axes: tuple[int, int, int] = (0, 1, 2),
     n_dims: int = 3,
 ):
-    from cellier.v2.data.mesh._mesh_memory_store import MeshMemoryStore
-    from cellier.v2.visuals._mesh_memory import MeshFlatAppearance
+    from cellier.data.mesh import MeshMemoryStore
+    from cellier.visuals import MeshFlatAppearance
 
     positions = _make_plane_positions(
         z_world,
@@ -1430,7 +1431,7 @@ class _OrientationUpdater:
         self._update_3d()
 
     def _update_3d(self) -> None:
-        from cellier.v2.transform import AffineTransform
+        from cellier.transform import AffineTransform
 
         for visual_id, centre_nd in zip(
             (self._xy_axis_visual_id, self._xz_axis_visual_id, self._yz_axis_visual_id),
@@ -1594,29 +1595,29 @@ def build_ortho_viewer_model(
 
     Returns
     -------
-    tuple[cellier.v2.viewer_model.ViewerModel, int | None]
+    tuple[cellier.viewer_model.ViewerModel, int | None]
         ``(viewer_model, effective_channel_axis)`` where ``effective_channel_axis``
         is the resolved channel axis index (auto-detected or user-supplied) or
         ``None`` when no channel axis is present.
     """
     import yaozarrs
-    from cellier.v2.data.image import OMEZarrImageDataStore
-    from cellier.v2.scene.cameras import (
+    from cellier.data.image import OMEZarrImageDataStore
+    from cellier.scene.cameras import (
         OrbitCameraController,
         OrthographicCamera,
         PanZoomCameraController,
         PerspectiveCamera,
     )
-    from cellier.v2.scene.canvas import Canvas
-    from cellier.v2.scene.dims import (
+    from cellier.scene.canvas import Canvas
+    from cellier.scene.dims import (
         AxisAlignedSelection,
         CoordinateSystem,
         DimsManager,
     )
-    from cellier.v2.scene.scene import Scene
-    from cellier.v2.transform import AffineTransform
-    from cellier.v2.viewer_model import DataManager, ViewerModel
-    from cellier.v2.visuals._image import (
+    from cellier.scene.scene import Scene
+    from cellier.transform import AffineTransform
+    from cellier.viewer_model import DataManager, ViewerModel
+    from cellier.visuals import (
         MultiscaleImageAppearance,
         MultiscaleImageRenderConfig,
         MultiscaleImageVisual,
@@ -2100,17 +2101,14 @@ def _build_and_show(
     _perf_mark(perf, "viewer.build.start", theme=theme)
     apply_theme(QApplication.instance(), theme)
     _perf_mark(perf, "viewer.build.theme_applied")
-    from cellier.v2.controller import CellierController
-    from cellier.v2.gui._scene import QtCanvasWidget, QtDimsSliders
-    from cellier.v2.render._config import (
+    from cellier.controller import CellierController
+    from cellier.gui import QtCanvasWidget, QtDimsSliders
+    from cellier.render import (
         RenderManagerConfig,
         SlicingConfig,
         TemporalAccumulationConfig,
     )
-    from cellier.v2.visuals._canvas_overlay import (
-        CenteredAxes2D,
-        CenteredAxes2DAppearance,
-    )
+    from cellier.visuals import CenteredAxes2D, CenteredAxes2DAppearance
 
     # User-supplied channel_axis drives the initial mode.
     # Auto-detected channel axes always start in single-channel mode with the
@@ -2167,8 +2165,8 @@ def _build_and_show(
     initial_multichannel_visual_ids: list | None = None
     initial_channel_appearances: dict | None = None
     if initial_mode == "multichannel" and effective_channel_axis is not None:
-        from cellier.v2.visuals._channel_appearance import ChannelAppearance
-        from cellier.v2.visuals._image import MultiscaleImageRenderConfig as _MC_RCfg
+        from cellier.visuals import ChannelAppearance
+        from cellier.visuals import MultiscaleImageRenderConfig as _MC_RCfg
 
         colormaps = _DEFAULT_COLORMAPS
         initial_channel_appearances = {
@@ -2567,7 +2565,7 @@ def _build_and_show(
     if spatial_ndim == 3:
         # Seed 3D orientation with post-fit camera state
         def _seed_camera_event(scene_id):
-            from cellier.v2.events._events import CameraChangedEvent
+            from cellier.events import CameraChangedEvent
 
             canvas_view = controller.get_canvas_view(
                 controller.get_canvas_ids(scene_id)[0]

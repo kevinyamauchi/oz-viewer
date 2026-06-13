@@ -52,7 +52,7 @@ class _MultiVisualClimSlider:
         decimals: int = 2,
         parent=None,
     ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
+        from cellier.events import AppearanceUpdateEvent
         from qtpy.QtCore import Qt
         from superqt import QLabeledDoubleRangeSlider
 
@@ -87,7 +87,7 @@ class _MultiVisualClimSlider:
         self._slider.blockSignals(False)
 
     def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+        from cellier.events import AppearanceChangedEvent, SubscriptionSpec
 
         if not self._visual_ids:
             return []
@@ -122,7 +122,7 @@ class _MultiVisualColormapCombo:
         initial_colormap,
         parent=None,
     ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
+        from cellier.events import AppearanceUpdateEvent
         from superqt import QColormapComboBox
 
         self._id = uuid4()
@@ -155,7 +155,7 @@ class _MultiVisualColormapCombo:
         self._combo.blockSignals(False)
 
     def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+        from cellier.events import AppearanceChangedEvent, SubscriptionSpec
 
         if not self._visual_ids:
             return []
@@ -192,7 +192,7 @@ class _MultiVisualLodBiasSlider:
         decimals: int = 2,
         parent=None,
     ) -> None:
-        from cellier.v2.events import AppearanceUpdateEvent
+        from cellier.events import AppearanceUpdateEvent
         from qtpy.QtCore import Qt
         from superqt import QLabeledDoubleSlider
 
@@ -230,7 +230,7 @@ class _MultiVisualLodBiasSlider:
         self._slider.blockSignals(False)
 
     def subscription_specs(self) -> list:
-        from cellier.v2.events import AppearanceChangedEvent, SubscriptionSpec
+        from cellier.events import AppearanceChangedEvent, SubscriptionSpec
 
         if not self._visual_ids:
             return []
