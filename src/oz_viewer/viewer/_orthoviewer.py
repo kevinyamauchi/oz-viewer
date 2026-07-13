@@ -450,7 +450,7 @@ class OmeZarrOrthoViewer:
 
     def _init_sc_controls(self) -> None:
         """Create and connect single-channel slider/combo widgets."""
-        from cellier.gui.visuals import (
+        from cellier.gui.qt.visuals import (
             QtClimRangeSlider,
             QtColormapComboBox,
             QtVolumeRenderControls,
@@ -2102,7 +2102,7 @@ def _build_and_show(
     apply_theme(QApplication.instance(), theme)
     _perf_mark(perf, "viewer.build.theme_applied")
     from cellier.controller import CellierController
-    from cellier.gui import QtCanvasWidget, QtDimsSliders
+    from cellier.gui.qt import QtCanvasWidget, QtDimsSliders
     from cellier.render import (
         RenderManagerConfig,
         SlicingConfig,

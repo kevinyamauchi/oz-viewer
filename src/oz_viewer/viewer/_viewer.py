@@ -67,7 +67,7 @@ class OmeZarrViewer:
         geometry: _ViewerGeometry,
         data_store=None,
     ) -> None:
-        from cellier.gui.visuals import (
+        from cellier.gui.qt.visuals import (
             QtClimRangeSlider,
             QtColormapComboBox,
             QtVolumeRenderControls,
@@ -843,7 +843,7 @@ def _build_and_show_viewer(
     _perf_mark(perf, "viewer.build.theme_applied")
 
     from cellier.controller import CellierController
-    from cellier.gui import QtCanvasWidget
+    from cellier.gui.qt import QtCanvasWidget
     from cellier.render import (
         RenderManagerConfig,
         SlicingConfig,
