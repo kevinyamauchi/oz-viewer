@@ -48,8 +48,21 @@ dependencies = [
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # add dependencies for "extra" features here.  Not dev dependencies.
-# [project.optional-dependencies]
-# name = ["dependency"]
+[project.optional-dependencies]
+# Dependencies for the notebook examples under examples/.  Install with
+# `pip install -e '.[examples]'`.  cellier[anywidget] adds the anywidget
+# front-end (notebook rendering); scikit-image + pooch provide the cells3d
+# sample dataset used by examples/viewer.ipynb.
+#
+# NOTE: the anywidget canvas backend currently requires rendercanvas from git
+# main, which cannot be expressed as a version pin here -- install it
+# separately:
+#   uv pip install "rendercanvas @ git+https://github.com/pygfx/rendercanvas.git"
+examples = [
+    "cellier[anywidget]>=0.0.24",
+    "scikit-image>=0.24",
+    "pooch",
+]
 
 [project.urls]
 homepage = "https://github.com/kevinyamauchi/oz-viewer"
@@ -148,6 +161,9 @@ ignore = [
 # https://github.com/crate-ci/typos/blob/master/docs/reference.md
 [tool.typos.default]
 extend-ignore-identifiers-re = []
+
+[tool.typos.files]
+extend-exclude = ["examples/*.ipynb"]
 
 [tool.typos.default.extend-words]
 # OME (Open Microscopy Environment) is a domain term, not a typo for "SOME"

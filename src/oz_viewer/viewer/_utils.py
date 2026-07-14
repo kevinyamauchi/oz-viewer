@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from cellier.convenience import SidecarOptions
+
     from oz_viewer._perf import StartupPerfTracer
 
 
@@ -19,6 +21,20 @@ def _dtype_clim_max(dtype: np.dtype) -> float:
 
 def _dtype_decimals(dtype: np.dtype) -> int:
     return 0 if np.issubdtype(dtype, np.integer) else 2
+
+
+def _sidecar_options(sidecar: bool, title: str) -> SidecarOptions | None:
+    """Turn the public ``sidecar: bool`` flag into a cellier ``SidecarOptions``.
+
+    Returns ``None`` when *sidecar* is falsy, so callers can pass the result
+    straight through to ``cellier.convenience.display(..., sidecar=...)``.
+    """
+    if not sidecar:
+        return None
+
+    from cellier.convenience import SidecarOptions
+
+    return SidecarOptions(title=title)
 
 
 def _perf_mark(perf: StartupPerfTracer | None, step: str, /, **fields: object) -> None:

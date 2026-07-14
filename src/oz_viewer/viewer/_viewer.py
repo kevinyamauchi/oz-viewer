@@ -1,780 +1,272 @@
-"""OmeZarrViewer: single-panel 2D / 3D toggle viewer for OME-Zarr images."""
+"""Single-panel 2D / 3D toggle viewer for OME-Zarr images.
+
+Rebuilt on top of :mod:`cellier.convenience`, so the same builder runs under
+both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter / marimo).
+The 2D/3D toggle, appearance controls, and per-channel controls are provided by
+cellier's cross-toolkit ``Layout`` docks; this module only supplies the
+OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and the
+Qt-specific launch niceties oz-viewer cares about (theme, fsspec loop, asyncio
+exception handling, startup perf tracing).
+"""
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal
 
-import numpy as np
-
-if TYPE_CHECKING:
-    from oz_viewer._perf import StartupPerfTracer
-
+from oz_viewer.viewer._geometry import _ViewerGeometry, extract_viewer_geometry
 from oz_viewer.viewer._utils import (
     _asyncio_exception_handler,
-    _dtype_clim_max,
-    _dtype_decimals,
     _ensure_qt_app,
     _perf_mark,
+    _sidecar_options,
 )
-from oz_viewer.viewer._widgets import (
-    _DEFAULT_COLORMAPS,
-    build_channel_list_widget,
-)
-
-# ---------------------------------------------------------------------------
-# Geometry descriptor
-# ---------------------------------------------------------------------------
-
-
-class _ViewerGeometry(NamedTuple):
-    """Scene geometry derived from OME-Zarr metadata; no Qt objects."""
-
-    spatial_indices: list[int]
-    spatial_ndim: int
-    displayed_axes_2d: tuple[int, ...]
-    displayed_axes_3d: tuple[int, ...]  # equals displayed_axes_2d when spatial_ndim < 3
-    world_max_spatial: np.ndarray
-    voxel_to_world: object
-    axis_ranges: dict[int, tuple[float, float]]
-    initial_slice_indices_2d: dict[int, float]
-    initial_slice_indices_3d: dict[int, float]
-    initial_clim_max: float
-    clim_range: tuple[float, float]
-    slider_decimals: int
-    channel_axis: int | None
-    n_channels: int
-
-
-# ---------------------------------------------------------------------------
-# Main viewer class
-# ---------------------------------------------------------------------------
-
-
-class OmeZarrViewer:
-    """Single-panel 2D / 3D toggle viewer for OME-Zarr images.
-
-    For interactive use (IPython / Jupyter) call :func:`viewer`.
-    For scripts and the CLI call :func:`launch_viewer`.
-    """
-
-    def __init__(
-        self,
-        controller,
-        scene,
-        canvas_widget,
-        visual_model,
-        geometry: _ViewerGeometry,
-        data_store=None,
-    ) -> None:
-        from cellier.gui.qt.visuals import (
-            QtClimRangeSlider,
-            QtColormapComboBox,
-            QtVolumeRenderControls,
-        )
-        from PySide6 import QtCore, QtWidgets
-        from PySide6.QtWidgets import QStackedWidget
-
-        self._controller = controller
-        self._scene = scene
-        self._canvas_widget = canvas_widget
-        self._visual_model = visual_model
-        self._geo = geometry
-        self._data_store = data_store
-
-        si = geometry.spatial_indices
-        # The axis that moves between displayed and sliced on 2D ↔ 3D toggle.
-        self._sz0: int | None = si[-3] if geometry.spatial_ndim >= 3 else None
-        self._displayed_axes_2d = geometry.displayed_axes_2d
-        self._displayed_axes_3d = geometry.displayed_axes_3d
-        self._active_mode = "2d"
-
-        # Independent LOD bias values per mode.
-        self._lod_bias_2d: float = visual_model.appearance.lod_bias
-        self._lod_bias_3d: float = visual_model.appearance.lod_bias
-
-        # Z world-coord to restore when re-entering 2D mode.
-        self._saved_z: float = (
-            float(geometry.initial_slice_indices_2d.get(self._sz0, 0))
-            if self._sz0 is not None
-            else 0.0
-        )
-
-        # Multichannel state.
-        self._mode_channel: str = "single"
-        self._mc_visual_id = None
-        self._channel_appearances: dict | None = None
-        self._mc_built: bool = False
-        # Saved channel index to restore when switching back to SC.
-        self._saved_channel: float = (
-            float(geometry.initial_slice_indices_2d.get(geometry.channel_axis, 0))
-            if geometry.channel_axis is not None
-            else 0.0
-        )
-
-        # ── Shared controls (single visual → auto-synced across modes) ───
-        clim_range = geometry.clim_range
-        slider_decimals = geometry.slider_decimals
-
-        self._clim_slider = QtClimRangeSlider(
-            visual_model.id,
-            clim_range=clim_range,
-            initial_clim=visual_model.appearance.clim,
-            decimals=slider_decimals,
-        )
-        controller.connect_widget(
-            self._clim_slider,
-            subscription_specs=self._clim_slider.subscription_specs(),
-        )
-
-        self._colormap_combo = QtColormapComboBox(
-            visual_model.id,
-            initial_colormap=visual_model.appearance.color_map,
-        )
-        self._colormap_combo.add_colormaps(_DEFAULT_COLORMAPS)
-        controller.connect_widget(
-            self._colormap_combo,
-            subscription_specs=self._colormap_combo.subscription_specs(),
-        )
-
-        # ── 3D-only render controls ───────────────────────────────────────
-        self._render_controls = QtVolumeRenderControls(
-            visual_model.id,
-            dtype_max=clim_range[1],
-            initial_render_mode=visual_model.appearance.render_mode,
-            initial_threshold=visual_model.appearance.iso_threshold,
-            initial_attenuation=visual_model.appearance.attenuation,
-            decimals=slider_decimals,
-        )
-        controller.connect_widget(
-            self._render_controls,
-            subscription_specs=self._render_controls.subscription_specs(),
-        )
-
-        # ── Qt window ─────────────────────────────────────────────────────
-        self._window = QtWidgets.QMainWindow()
-        self._window.setWindowTitle("OME-Zarr Viewer")
-        self._window.resize(1100, 750)
-
-        central = QtWidgets.QWidget()
-        self._window.setCentralWidget(central)
-        root_layout = QtWidgets.QHBoxLayout(central)
-
-        # Side panel on the left.
-        panel = QtWidgets.QWidget()
-        panel.setFixedWidth(300)
-        panel_layout = QtWidgets.QVBoxLayout(panel)
-        panel_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        root_layout.addWidget(panel)
-        root_layout.addWidget(canvas_widget.widget, stretch=1)
-
-        # ── 2D/3D toggle button ───────────────────────────────────────────
-        self._toggle_btn = QtWidgets.QPushButton("Switch to 3D")
-        self._toggle_btn.clicked.connect(self._on_toggle_clicked)
-        if geometry.spatial_ndim < 3:
-            self._toggle_btn.setEnabled(False)
-            self._toggle_btn.setToolTip(
-                "3D view requires at least 3 spatial dimensions"
-            )
-        panel_layout.addWidget(self._toggle_btn)
-
-        self._mode_label = QtWidgets.QLabel("Mode: 2D")
-        panel_layout.addWidget(self._mode_label)
-
-        # ── SC/MC toggle button (only when a channel axis exists) ─────────
-        if geometry.channel_axis is not None:
-            self._toggle_mc_btn = QtWidgets.QPushButton("Switch to Multichannel")
-            self._toggle_mc_btn.clicked.connect(self._on_mc_toggle_clicked)
-            panel_layout.addWidget(self._toggle_mc_btn)
-        else:
-            self._toggle_mc_btn = None
-
-        # ── Outer stacked widget: page 0 = single-channel, page 1 = MC ───
-        self._channel_stack = QStackedWidget()
-        panel_layout.addWidget(self._channel_stack)
-
-        # ── SC page (page 0) ──────────────────────────────────────────────
-        sc_page = QtWidgets.QWidget()
-        sc_layout = QtWidgets.QVBoxLayout(sc_page)
-        sc_layout.setContentsMargins(0, 0, 0, 0)
-        sc_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-
-        clim_group = QtWidgets.QGroupBox("Contrast limits")
-        QtWidgets.QVBoxLayout(clim_group).addWidget(self._clim_slider.widget)
-        sc_layout.addWidget(clim_group)
-
-        cmap_group = QtWidgets.QGroupBox("Colormap")
-        QtWidgets.QVBoxLayout(cmap_group).addWidget(self._colormap_combo.widget)
-        sc_layout.addWidget(cmap_group)
-
-        # Inner stacked widget: 2D/3D mode-specific controls.
-        self._mode_stack = QStackedWidget()
-        sc_layout.addWidget(self._mode_stack)
-
-        # Page 0 — 2D controls
-        page_2d = QtWidgets.QWidget()
-        layout_2d = QtWidgets.QVBoxLayout(page_2d)
-        layout_2d.setContentsMargins(0, 0, 0, 0)
-        layout_2d.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        lod_2d_group = QtWidgets.QGroupBox("Fine-coarse tile bias")
-        lod_2d_group.setToolTip("Bigger values use coarser tiles")
-        self._lod_bias_2d_slider = self._make_lod_slider("2d")
-        QtWidgets.QVBoxLayout(lod_2d_group).addWidget(self._lod_bias_2d_slider)
-        layout_2d.addWidget(lod_2d_group)
-        self._mode_stack.addWidget(page_2d)
-
-        # Page 1 — 3D controls
-        page_3d = QtWidgets.QWidget()
-        layout_3d = QtWidgets.QVBoxLayout(page_3d)
-        layout_3d.setContentsMargins(0, 0, 0, 0)
-        layout_3d.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        render_group = QtWidgets.QGroupBox("Render mode")
-        QtWidgets.QVBoxLayout(render_group).addWidget(self._render_controls.widget)
-        layout_3d.addWidget(render_group)
-        lod_3d_group = QtWidgets.QGroupBox("Fine-coarse tile bias")
-        lod_3d_group.setToolTip("Bigger values use coarser tiles")
-        self._lod_bias_3d_slider = self._make_lod_slider("3d")
-        QtWidgets.QVBoxLayout(lod_3d_group).addWidget(self._lod_bias_3d_slider)
-        layout_3d.addWidget(lod_3d_group)
-        self._mode_stack.addWidget(page_3d)
-
-        self._mode_stack.setCurrentIndex(0)
-        self._channel_stack.addWidget(sc_page)
-
-        # ── MC page (page 1) — populated lazily on first toggle ───────────
-        self._mc_page = QtWidgets.QWidget()
-        self._mc_page_layout = QtWidgets.QVBoxLayout(self._mc_page)
-        self._mc_page_layout.setContentsMargins(0, 0, 0, 0)
-        self._mc_page_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        self._channel_stack.addWidget(self._mc_page)
-
-        self._channel_stack.setCurrentIndex(0)
-
-        # ── Camera settle threshold ───────────────────────────────────────────
-        settle_group = QtWidgets.QGroupBox("Camera settle (ms)")
-        settle_layout = QtWidgets.QVBoxLayout(settle_group)
-        from PySide6.QtWidgets import QDoubleSpinBox
-
-        self._settle_sb = QDoubleSpinBox()
-        self._settle_sb.setRange(50.0, 2000.0)
-        self._settle_sb.setSingleStep(50.0)
-        self._settle_sb.setDecimals(0)
-        self._settle_sb.setValue(300.0)
-        self._settle_sb.valueChanged.connect(
-            lambda v: setattr(controller, "camera_settle_threshold_s", v / 1000.0)
-        )
-        settle_layout.addWidget(self._settle_sb)
-        panel_layout.addWidget(settle_group)
-
-        panel_layout.addStretch()
-
-    # ------------------------------------------------------------------
-    # LOD bias helpers
-    # ------------------------------------------------------------------
-
-    def _make_lod_slider(self, mode: str):
-        from qtpy.QtCore import Qt
-        from superqt import QLabeledDoubleSlider
-
-        initial = self._lod_bias_2d if mode == "2d" else self._lod_bias_3d
-        slider = QLabeledDoubleSlider(Qt.Orientation.Horizontal)
-        slider.setRange(1e-6, 5.0)
-        slider.setDecimals(2)
-        slider.setValue(initial)
-
-        def _on_released() -> None:
-            if self._active_mode != mode:
-                return
-            value = slider.value()
-            if mode == "2d":
-                self._lod_bias_2d = value
-            else:
-                self._lod_bias_3d = value
-            self._controller.update_appearance_field(
-                self._visual_model.id, "lod_bias", value
-            )
-
-        slider.sliderReleased.connect(_on_released)
-        return slider
-
-    # ------------------------------------------------------------------
-    # Mode toggle
-    # ------------------------------------------------------------------
-
-    def _on_toggle_clicked(self) -> None:
-        current_slice = dict(self._scene.dims.selection.slice_indices)
-        self._controller.cancel_pending_slices(self._scene.id)
-        in_sc = self._mode_channel == "single"
-
-        if self._active_mode == "2d":
-            # Save the Z world-coord before it leaves slice_indices.
-            if self._sz0 is not None:
-                self._saved_z = float(
-                    current_slice.get(
-                        self._sz0,
-                        self._geo.initial_slice_indices_2d.get(self._sz0, 0),
-                    )
-                )
-            # sz0 becomes displayed in 3D — drop it from slice_indices.
-            new_slice = {k: v for k, v in current_slice.items() if k != self._sz0}
-
-            # Update LOD bias only when the SC visual is active.
-            if in_sc:
-                self._lod_bias_2d = self._lod_bias_2d_slider.value()
-                self._controller.update_appearance_field(
-                    self._visual_model.id, "lod_bias", self._lod_bias_3d
-                )
-                self._lod_bias_3d_slider.blockSignals(True)
-                self._lod_bias_3d_slider.setValue(self._lod_bias_3d)
-                self._lod_bias_3d_slider.blockSignals(False)
-
-            self._controller.update_slice_indices(self._scene.id, new_slice)
-            self._controller.set_displayed_axes(self._scene.id, self._displayed_axes_3d)
-            self._active_mode = "3d"
-            self._mode_label.setText("Mode: 3D")
-            self._toggle_btn.setText("Switch to 2D")
-            if in_sc:
-                self._mode_stack.setCurrentIndex(1)
-
-        else:
-            # Restore sz0 into slice_indices.
-            new_slice = dict(current_slice)
-            if self._sz0 is not None:
-                new_slice[self._sz0] = self._saved_z
-
-            # Update LOD bias only when the SC visual is active.
-            if in_sc:
-                self._lod_bias_3d = self._lod_bias_3d_slider.value()
-                self._controller.update_appearance_field(
-                    self._visual_model.id, "lod_bias", self._lod_bias_2d
-                )
-                self._lod_bias_2d_slider.blockSignals(True)
-                self._lod_bias_2d_slider.setValue(self._lod_bias_2d)
-                self._lod_bias_2d_slider.blockSignals(False)
-
-            self._controller.update_slice_indices(self._scene.id, new_slice)
-            self._controller.set_displayed_axes(self._scene.id, self._displayed_axes_2d)
-            self._active_mode = "2d"
-            self._mode_label.setText("Mode: 2D")
-            self._toggle_btn.setText("Switch to 3D")
-            if in_sc:
-                self._mode_stack.setCurrentIndex(0)
-
-    # ------------------------------------------------------------------
-    # Multichannel toggle
-    # ------------------------------------------------------------------
-
-    def _on_mc_toggle_clicked(self) -> None:
-        to_mc = self._mode_channel == "single"
-
-        if to_mc:
-            if not self._mc_built:
-                self._build_mc_visual()
-                self._build_mc_page()
-            # Hide SC visual (has .appearance), show each MC channel.
-            self._controller.update_appearance_field(
-                self._visual_model.id, "visible", False
-            )
-            self._set_mc_visible(True)
-            # Move channel axis from slice_indices → stacked_axes so the slider hides.
-            ch = self._geo.channel_axis
-            if ch is not None:
-                current = dict(self._scene.dims.selection.slice_indices)
-                self._saved_channel = float(current.get(ch, self._saved_channel))
-                current.pop(ch, None)
-                self._controller.update_slice_indices(self._scene.id, current)
-                self._controller.set_stacked_axes(self._scene.id, (ch,))
-            self._channel_stack.setCurrentIndex(1)
-            self._mode_channel = "multichannel"
-            if self._toggle_mc_btn is not None:
-                self._toggle_mc_btn.setText("Switch to Single Channel")
-        else:
-            # Hide each MC channel, show SC visual.
-            self._set_mc_visible(False)
-            self._controller.update_appearance_field(
-                self._visual_model.id, "visible", True
-            )
-            # Move channel axis from stacked_axes → slice_indices
-            # so the slider reappears.
-            ch = self._geo.channel_axis
-            if ch is not None:
-                self._controller.set_stacked_axes(self._scene.id, ())
-                current = dict(self._scene.dims.selection.slice_indices)
-                current[ch] = self._saved_channel
-                self._controller.update_slice_indices(self._scene.id, current)
-            self._channel_stack.setCurrentIndex(0)
-            # Sync the 2D/3D inner stack to the current active mode — it
-            # was not updated while _channel_stack was on the MC page.
-            self._mode_stack.setCurrentIndex(0 if self._active_mode == "2d" else 1)
-            self._mode_channel = "single"
-            if self._toggle_mc_btn is not None:
-                self._toggle_mc_btn.setText("Switch to Multichannel")
-
-    def _set_mc_visible(self, visible: bool) -> None:
-        """Set visible on every ChannelAppearance of the MC visual."""
-        mc_model = self._controller.get_visual_model(self._mc_visual_id)
-        for ch in mc_model.channels.values():
-            ch.visible = visible
-
-    def _build_mc_visual(self) -> None:
-        from cellier.visuals import ChannelAppearance, MultiscaleImageRenderConfig
-
-        geo = self._geo
-        channel_appearances = {
-            i: ChannelAppearance(
-                color_map=_DEFAULT_COLORMAPS[i % len(_DEFAULT_COLORMAPS)],
-                clim=(0.0, geo.initial_clim_max),
-                visible=False,
-            )
-            for i in range(geo.n_channels)
-        }
-        render_config = MultiscaleImageRenderConfig(
-            block_size=32,
-            gpu_budget_bytes=512 * 1024**2,
-            gpu_budget_bytes_2d=64 * 1024**2,
-        )
-        mc_visual = self._controller.add_multichannel_image_multiscale(
-            data=self._data_store,
-            scene_id=self._scene.id,
-            channel_axis=geo.channel_axis,
-            channels=channel_appearances,
-            name="multichannel_volume",
-            render_config=render_config,
-            transform=geo.voxel_to_world,
-        )
-        self._mc_visual_id = mc_visual.id
-        self._channel_appearances = channel_appearances
-        self._mc_built = True
-
-    def _build_mc_page(self) -> None:
-        geo = self._geo
-        self._mc_page_layout.addWidget(
-            build_channel_list_widget(
-                self._channel_appearances, geo.clim_range, geo.slider_decimals
-            )
-        )
-
-    # ------------------------------------------------------------------
-
-    @property
-    def window(self):
-        return self._window
-
-    def close_widgets(self) -> None:
-        self._canvas_widget.close()
-        self._clim_slider.close()
-        self._colormap_combo.close()
-        self._render_controls.close()
-
-
-# ---------------------------------------------------------------------------
-# Layer 1: ViewerModel builder (no Qt)
-# ---------------------------------------------------------------------------
-
-
-def build_viewer_model(
-    zarr_uri: str,
-    *,
-    channel_axis: int | None = None,
-    perf: StartupPerfTracer | None = None,
-) -> tuple:
-    """Build a ViewerModel for the viewer without constructing any Qt objects.
-
-    Parameters
-    ----------
-    zarr_uri : str
-        Path or URI to the OME-Zarr store.
-    channel_axis : int or None, optional
-        Axis index to treat as the channel dimension.  When ``None`` (default),
-        the channel axis is auto-detected from the OME-Zarr axis metadata.
-    perf : StartupPerfTracer | None, optional
-        Optional startup performance tracer.
-
-    Returns
-    -------
-    tuple[cellier.viewer_model.ViewerModel, _ViewerGeometry]
-    """
-    import yaozarrs
+from oz_viewer.viewer._widgets import _DEFAULT_COLORMAPS
+
+if TYPE_CHECKING:
+    from cellier.convenience import Viewer
+    from cellier.convenience.layout._spec import Layout
     from cellier.data.image import OMEZarrImageDataStore
-    from cellier.scene.cameras import (
-        OrbitCameraController,
-        OrthographicCamera,
-        PanZoomCameraController,
-        PerspectiveCamera,
-    )
-    from cellier.scene.canvas import Canvas
-    from cellier.scene.dims import (
-        AxisAlignedSelection,
-        CoordinateSystem,
-        DimsManager,
-    )
-    from cellier.scene.scene import Scene
-    from cellier.transform import AffineTransform
-    from cellier.viewer_model import DataManager, ViewerModel
-    from cellier.visuals import (
-        MultiscaleImageAppearance,
-        MultiscaleImageRenderConfig,
-        MultiscaleImageVisual,
-    )
-    from rich.console import Console
-    from rich.table import Table
 
-    _perf_mark(perf, "viewer.model.start", zarr_uri=zarr_uri)
-    data_store = OMEZarrImageDataStore.from_path(zarr_uri)
-    _perf_mark(perf, "viewer.model.data_store_ready", n_levels=data_store.n_levels)
+    from oz_viewer._perf import StartupPerfTracer
 
-    group = yaozarrs.open_group(data_store.zarr_path)
-    ome_image = group.ome_metadata()
-    ms = ome_image.multiscales[data_store.multiscale_index]
+# Appearance fields exposed in the single-channel appearance dock, in order.
+_APPEARANCE_FIELDS = [
+    "color_map",
+    "clim",
+    "render_mode",
+    "iso_threshold",
+    "attenuation",
+    "lod_bias",
+]
+# Per-channel fields exposed in the multichannel dock, in order.
+_CHANNEL_FIELDS = ["visible", "color_map", "clim", "opacity"]
 
-    n_dims = len(data_store.level_shapes[0])
+_INITIAL_LOD_BIAS = 1.5
 
-    # Detect channel axis from OME-Zarr axis metadata when not explicitly set.
-    if channel_axis is None:
-        effective_channel_axis: int | None = None
-        for idx, ax in enumerate(ms.axes):
-            if getattr(ax, "type", None) == "channel":
-                effective_channel_axis = idx
-                break
-    else:
-        effective_channel_axis = channel_axis
-    channel_axis = effective_channel_axis
 
-    spatial_indices: list[int] = [i for i in range(n_dims) if i != channel_axis]
-    spatial_ndim = len(spatial_indices)
-
-    level_0_scale_full = np.array(
-        ms.datasets[0].scale_transform.scale, dtype=np.float64
-    )
-    level_0_scale_spatial = level_0_scale_full[spatial_indices]
-
-    vox_shape_spatial = np.array(
-        [data_store.level_shapes[0][i] for i in spatial_indices], dtype=np.float64
-    )
-    world_extents_spatial = vox_shape_spatial * level_0_scale_spatial
-    max_extent = float(world_extents_spatial.max())
-    depth_range = (max(1.0, max_extent * 0.0001), max_extent * 10.0)
-
-    vox_shape_full = np.array(data_store.level_shapes[0], dtype=np.float64)
-    world_max_full = (vox_shape_full - 1) * level_0_scale_full
-    world_max_spatial = (vox_shape_spatial - 1) * level_0_scale_spatial
-
-    # Print startup summary.
-    spatial_label = "spatial" if channel_axis is not None else "ZYX"[-spatial_ndim:]
-    table = Table(
-        title=f"OME-Zarr  [dim]{zarr_uri}[/dim]",
-        show_header=False,
-        box=None,
-        padding=(0, 2),
-    )
-    table.add_column("Field", style="bold cyan", no_wrap=True)
-    table.add_column("Value")
-    table.add_row("dtype", str(data_store.dtype))
-    table.add_row("axes", "  ".join(data_store.axis_names))
-    table.add_row("units", "  ".join(str(u) for u in data_store.axis_units))
-    table.add_row("levels", str(data_store.n_levels))
-    for i, shape in enumerate(data_store.level_shapes):
-        table.add_row(f"  level {i}", str(list(shape)))
-    table.add_row(
-        f"scale ({spatial_label})",
-        "  ".join(f"{v:.4g}" for v in level_0_scale_spatial),
-    )
-    table.add_row(
-        f"world extents ({spatial_label})",
-        "  ".join(f"{v:.4g}" for v in world_extents_spatial),
-    )
-    table.add_row("depth range", f"near={depth_range[0]:.2f}  far={depth_range[1]:.0f}")
-    Console().print(table)
-    _perf_mark(perf, "viewer.model.metadata_printed")
-
-    cs = CoordinateSystem(name="world", axis_labels=tuple(data_store.axis_names))
-    voxel_to_world = AffineTransform.from_scale_and_translation(
-        scale=tuple(level_0_scale_full)
+def _render_config() -> object:
+    """The controller render-pipeline config used by both viewers."""
+    from cellier.render import (
+        RenderManagerConfig,
+        SlicingConfig,
+        TemporalAccumulationConfig,
     )
 
-    initial_clim_max = _dtype_clim_max(data_store.dtype)
-    slider_decimals = _dtype_decimals(data_store.dtype)
-    n_channels = (
-        int(data_store.level_shapes[0][channel_axis]) if channel_axis is not None else 0
+    return RenderManagerConfig(
+        slicing=SlicingConfig(batch_size=32, render_every=4),
+        temporal=TemporalAccumulationConfig(enabled=False),
     )
 
-    # axis_ranges covers all axes; dims sliders appear for non-displayed axes.
-    axis_ranges = {i: (0.0, round(float(world_max_full[i]))) for i in range(n_dims)}
 
-    def _mid(ax: int) -> float:
-        return round(float(world_max_full[ax]) / 2.0)
+def _visual_render_config() -> object:
+    """LOD / GPU-budget config for the single-panel multiscale visual."""
+    from cellier.visuals import MultiscaleImageRenderConfig
 
-    # 2D: display last 2 spatial axes; 3D: display last 3 spatial axes.
-    if spatial_ndim >= 2:
-        displayed_axes_2d: tuple[int, ...] = tuple(spatial_indices[-2:])
-    else:
-        displayed_axes_2d = tuple(spatial_indices)
-
-    if spatial_ndim >= 3:
-        displayed_axes_3d: tuple[int, ...] = tuple(spatial_indices[-3:])
-    else:
-        displayed_axes_3d = displayed_axes_2d
-
-    _set_2d = set(displayed_axes_2d)
-    _set_3d = set(displayed_axes_3d)
-    initial_slice_indices_2d = {i: _mid(i) for i in range(n_dims) if i not in _set_2d}
-    initial_slice_indices_3d = {i: _mid(i) for i in range(n_dims) if i not in _set_3d}
-
-    # Single visual for both 2D and 3D rendering.
-    visual = MultiscaleImageVisual(
-        name="volume",
-        data_store_id=str(data_store.id),
-        level_transforms=data_store.level_transforms,
-        appearance=MultiscaleImageAppearance(
-            color_map="viridis",
-            clim=(0.0, initial_clim_max),
-            lod_bias=1.5,
-            force_level=None,
-            frustum_cull=True,
-            iso_threshold=initial_clim_max / 2.0,
-            render_mode="mip",
-            attenuation=1.0,
-        ),
-        render_config=MultiscaleImageRenderConfig(
-            block_size=32,
-            gpu_budget_bytes=2048 * 1024**2,
-            gpu_budget_bytes_2d=64 * 1024**2,
-        ),
-        transform=voxel_to_world,
+    return MultiscaleImageRenderConfig(
+        block_size=32,
+        gpu_budget_bytes=2048 * 1024**2,
+        gpu_budget_bytes_2d=64 * 1024**2,
     )
-
-    # Single canvas: orthographic camera for 2D, perspective for 3D.
-    canvas = Canvas(
-        cameras={
-            "2d": OrthographicCamera(
-                near_clipping_plane=depth_range[0],
-                far_clipping_plane=depth_range[1],
-                controller=PanZoomCameraController(enabled=True),
-            ),
-            "3d": PerspectiveCamera(
-                fov=70.0,
-                near_clipping_plane=depth_range[0],
-                far_clipping_plane=depth_range[1],
-                controller=OrbitCameraController(enabled=True),
-            ),
-        }
-    )
-
-    # Scene supports both render modes; starts in 2D.
-    scene = Scene(
-        name="main",
-        dims=DimsManager(
-            coordinate_system=cs,
-            selection=AxisAlignedSelection(
-                displayed_axes=displayed_axes_2d,
-                slice_indices=initial_slice_indices_2d,
-            ),
-        ),
-        render_modes={"2d", "3d"},
-        lighting="none",
-        visuals=[visual],
-        canvases={canvas.id: canvas},
-    )
-
-    viewer_model = ViewerModel(
-        data=DataManager(stores={data_store.id: data_store}),
-        scenes={scene.id: scene},
-    )
-    _perf_mark(perf, "viewer.model.ready")
-
-    geometry = _ViewerGeometry(
-        spatial_indices=spatial_indices,
-        spatial_ndim=spatial_ndim,
-        displayed_axes_2d=displayed_axes_2d,
-        displayed_axes_3d=displayed_axes_3d,
-        world_max_spatial=world_max_spatial,
-        voxel_to_world=voxel_to_world,
-        axis_ranges=axis_ranges,
-        initial_slice_indices_2d=initial_slice_indices_2d,
-        initial_slice_indices_3d=initial_slice_indices_3d,
-        initial_clim_max=initial_clim_max,
-        clim_range=(0.0, initial_clim_max),
-        slider_decimals=slider_decimals,
-        channel_axis=channel_axis,
-        n_channels=n_channels,
-    )
-    return viewer_model, geometry
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Qt bootstrap helper  (imported from _utils)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Layer 3: Non-blocking show (interactive / Jupyter)
+# Layer 1: build the convenience Viewer (no launch, no Qt event loop)
 # ---------------------------------------------------------------------------
 
 
-def viewer(
-    zarr_uri: str,
-    theme: str = "dark",
-) -> OmeZarrViewer:
-    """Open a viewer window without blocking.
+def build_viewer(
+    data_store: OMEZarrImageDataStore,
+    geometry: _ViewerGeometry,
+    *,
+    gui: Literal["qt", "anywidget"] = "qt",
+) -> Viewer:
+    """Build a :class:`cellier.convenience.Viewer` for an OME-Zarr store.
 
-    Intended for interactive use (Jupyter Lab, IPython). The Qt event loop
-    must already be running or be startable via IPython's ``enable_gui``; this
-    function sets that up automatically. For scripts use :func:`launch_viewer`.
+    Chooses a single-channel or multichannel visual at build time based on
+    whether *geometry* found a channel axis (D1 in the conversion plan): there
+    is no runtime single<->multichannel toggle.
 
     Parameters
     ----------
-    zarr_uri : str
-        Path or URI to the OME-Zarr store.
-    theme : str
-        Registered theme name. Defaults to ``"dark"``.
-        Use ``oz_viewer.theme.list_themes()`` to see available themes.
+    data_store : OMEZarrImageDataStore
+        The backing multiscale store.
+    geometry : _ViewerGeometry
+        Metadata extracted by :func:`extract_viewer_geometry`.
+    gui : "qt" or "anywidget"
+        Which toolkit the viewer renders into.
 
     Returns
     -------
-    OmeZarrViewer
-        The viewer window object. Keep a reference to prevent garbage collection.
+    cellier.convenience.Viewer
     """
-    app = _ensure_qt_app()
-    if app is None:
-        raise RuntimeError(
-            "No Qt event loop is running. "
-            "Use launch_viewer() for scripts, or run inside IPython/Jupyter."
-        )
-    return _build_and_show_viewer(zarr_uri, theme=theme)
+    from cellier.convenience import Viewer
 
-
-# ---------------------------------------------------------------------------
-# Layer 4: Private async core
-# ---------------------------------------------------------------------------
-
-
-async def _run_viewer_async(
-    zarr_uri: str,
-    theme: str = "dark",
-    *,
-    channel_axis: int | None = None,
-    perf: StartupPerfTracer | None = None,
-) -> None:
-    import asyncio as _asyncio
-
-    from PySide6.QtWidgets import QApplication
-
-    _asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
-    _perf_mark(perf, "viewer.async.start", theme=theme)
-
-    v = _build_and_show_viewer(
-        zarr_uri, theme=theme, channel_axis=channel_axis, perf=perf
+    viewer = Viewer(
+        axis_labels=geometry.axis_names,
+        dim="2d",
+        render_config=_render_config(),
+        gui=gui,
     )
-    _perf_mark(perf, "viewer.async.build_complete")
+    viewer.controller.camera_reslice_enabled = True
+    viewer.controller.camera_settle_threshold_s = 0.3
 
-    app = QApplication.instance()
-    close_event = asyncio.Event()
-    app.aboutToQuit.connect(close_event.set)
-    app.aboutToQuit.connect(v.close_widgets)
-    await close_event.wait()
+    if geometry.channel_axis is not None:
+        _add_multichannel_visual(viewer, data_store, geometry)
+    else:
+        _add_single_channel_visual(viewer, data_store, geometry)
+
+    # Center the sliced spatial axis (e.g. Z) at the volume midpoint; extra
+    # axes such as channel keep their default position of 0.
+    center = geometry.center_slice_indices()
+    current = dict(viewer.scene.dims.selection.slice_indices)
+    updated = {a: center[a] for a in center if a in current}
+    if updated:
+        current.update(updated)
+        viewer.controller.update_slice_indices(viewer.scene.id, current)
+
+    return viewer
+
+
+def _add_single_channel_visual(
+    viewer: Viewer,
+    data_store: OMEZarrImageDataStore,
+    geometry: _ViewerGeometry,
+) -> None:
+    """Add a single-channel multiscale image visual + appearance controls."""
+    clim_max = geometry.initial_clim_max
+    viewer.add_image_multiscale(
+        data_store,
+        appearance={
+            "color_map": "viridis",
+            "clim": (0.0, clim_max),
+            "lod_bias": _INITIAL_LOD_BIAS,
+            "iso_threshold": clim_max / 2.0,
+            "render_mode": "mip",
+            "attenuation": 1.0,
+        },
+        name="volume",
+        render_config=_visual_render_config(),
+        transform=geometry.voxel_to_world,
+        controls={
+            "appearance": _APPEARANCE_FIELDS,
+            "colormap_names": _DEFAULT_COLORMAPS,
+            "clim_range": geometry.clim_range,
+        },
+    )
+
+
+def _add_multichannel_visual(
+    viewer: Viewer,
+    data_store: OMEZarrImageDataStore,
+    geometry: _ViewerGeometry,
+) -> None:
+    """Add a multichannel multiscale visual + per-channel controls.
+
+    The channel axis is moved to ``stacked_axes`` so it renders as a stack (all
+    channels at once) and no redundant dims slider appears for it -- the
+    ``ChannelControls`` dock owns per-channel visibility instead.
+    """
+    from cellier.visuals import ChannelAppearance
+
+    clim_max = geometry.initial_clim_max
+    channel_axis = geometry.channel_axis
+    assert channel_axis is not None
+    n = geometry.n_channels
+    # Start every channel visible; the ChannelControls dock toggles from there.
+    channels = {
+        i: ChannelAppearance(
+            color_map=_DEFAULT_COLORMAPS[i % len(_DEFAULT_COLORMAPS)],
+            clim=(0.0, clim_max),
+            visible=True,
+        )
+        for i in range(n)
+    }
+    # Raise the channel-node budget to cover every channel so construction and
+    # the ChannelControls dock never exceed the cap for real (few-channel) data.
+    max_channels = max(8, n)
+    viewer.add_multichannel_image_multiscale(
+        data_store,
+        channel_axis=channel_axis,
+        channels=channels,
+        name="multichannel_volume",
+        render_config=_visual_render_config(),
+        transform=geometry.voxel_to_world,
+        max_channels_2d=max_channels,
+        max_channels_3d=max_channels,
+        controls={
+            "fields": _CHANNEL_FIELDS,
+            "colormap_names": _DEFAULT_COLORMAPS,
+            "clim_range": geometry.clim_range,
+        },
+    )
+
+    # Stack the channel axis: drop it from slice_indices and mark it stacked so
+    # the multichannel visual renders every channel and no slider is shown.
+    current = dict(viewer.scene.dims.selection.slice_indices)
+    current.pop(channel_axis, None)
+    viewer.controller.update_slice_indices(viewer.scene.id, current)
+    viewer.controller.set_stacked_axes(viewer.scene.id, (channel_axis,))
+
+
+def build_viewer_layout(
+    viewer: Viewer,
+    geometry: _ViewerGeometry,
+    *,
+    min_canvas_size: tuple[int, int] | None = None,
+) -> tuple[Layout, object]:
+    """Build the canvas widget and the :class:`Layout` for *viewer*.
+
+    Parameters
+    ----------
+    viewer : Viewer
+        The viewer to build a layout for.
+    geometry : _ViewerGeometry
+        The panel geometry describing the canvas layout.
+    min_canvas_size : tuple[int, int] or None, optional
+        Minimum CSS pixel size ``(width, height)`` for the anywidget canvas.
+        Ignored for the Qt gui. Defaults to cellier's built-in ``(600, 600)``
+        when ``None``.
+
+    Returns
+    -------
+    tuple[Layout, canvas_view]
+        The layout spec plus the canvas view/widget (kept by the caller so it
+        can install a paint tracker or avoid GC).
+    """
+    from cellier.convenience import (
+        AppearanceControls,
+        ChannelControls,
+        Layout,
+        SceneControls,
+    )
+    from cellier.convenience.gui import build_canvas_widget
+
+    canvas_view = build_canvas_widget(
+        viewer,
+        geometry.axis_ranges,
+        depth_range_3d=geometry.depth_range,
+        canvas_size=min_canvas_size,
+    )
+
+    # Left dock: per-channel controls for multichannel data, otherwise the
+    # single-channel appearance panel.  Bottom dock: 2D/3D toggle (needs >=3
+    # spatial axes to be meaningful).
+    if geometry.channel_axis is not None:
+        left: object = ChannelControls()
+    else:
+        left = AppearanceControls()
+
+    docks: dict[str, object] = {"left_dock": left}
+    if geometry.spatial_ndim >= 3:
+        docks["bottom_dock"] = SceneControls()
+
+    layout = Layout(center=canvas_view, **docks)
+    return layout, canvas_view
 
 
 # ---------------------------------------------------------------------------
-# Layer 5: Blocking launcher (scripts / CLI)
+# Layer 2: blocking Qt launcher (scripts / CLI)
 # ---------------------------------------------------------------------------
 
 
@@ -784,144 +276,243 @@ def launch_viewer(
     *,
     channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
+    gui: Literal["qt", "anywidget"] = "qt",
 ) -> None:
     """Open a viewer window and block until it is closed.
 
     Creates a ``QApplication`` if one does not already exist, then runs the
-    Qt + asyncio event loop via ``QtAsyncio``. Intended for scripts and the
-    CLI. For interactive/Jupyter use, call :func:`viewer` instead.
+    Qt + asyncio event loop via ``QtAsyncio``.  Intended for scripts and the
+    CLI.  For notebook (anywidget) use, call :func:`display_viewer`; for
+    interactive Qt (IPython) use :func:`viewer`.
 
     Parameters
     ----------
     zarr_uri : str
         Path or URI to the OME-Zarr store.
     theme : str
-        Registered theme name. Defaults to ``"dark"``.
-        Use ``oz_viewer.theme.list_themes()`` to see available themes.
+        Registered theme name.  Defaults to ``"dark"``.
     channel_axis : int or None, optional
-        Axis index to treat as the channel dimension.  When ``None`` (default),
-        the channel axis is auto-detected from the OME-Zarr axis metadata.
-    perf : StartupPerfTracer | None, optional
+        Axis index to treat as the channel dimension.  Auto-detected from the
+        OME-Zarr metadata when ``None``.
+    perf : StartupPerfTracer or None, optional
         Optional startup performance tracer.
+    gui : "qt" or "anywidget"
+        Toolkit.  ``"anywidget"`` is not launchable from a script/CLI; use
+        :func:`display_viewer` in a notebook instead.
     """
+    if gui == "anywidget":
+        raise ValueError(
+            "gui='anywidget' cannot be launched from a script or the CLI. "
+            "In a Jupyter/marimo notebook call "
+            "oz_viewer.viewer.display_viewer(zarr_uri) instead."
+        )
+
     import sys
 
     import fsspec.asyn as _fsspec_asyn
     import PySide6.QtAsyncio as QtAsyncio
     from PySide6.QtWidgets import QApplication
 
+    from oz_viewer.theme import apply_theme
+
+    # Ensure fsspec's background event loop exists before QtAsyncio takes over
+    # the main loop; required for remote (s3/https) OME-Zarr stores.
     _fsspec_asyn.get_loop()
 
     _perf_mark(perf, "viewer.launch.start", theme=theme)
-    app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
+    app = QApplication.instance() or QApplication([sys.argv[0]])
+    apply_theme(app, theme)
     _perf_mark(perf, "viewer.launch.qapp_ready")
+
     QtAsyncio.run(
-        _run_viewer_async(zarr_uri, theme=theme, channel_axis=channel_axis, perf=perf),
+        _run_viewer_async(zarr_uri, channel_axis=channel_axis, perf=perf),
         handle_sigint=True,
     )
 
 
+async def _run_viewer_async(
+    zarr_uri: str,
+    *,
+    channel_axis: int | None = None,
+    perf: StartupPerfTracer | None = None,
+) -> None:
+    """Build, show, and keep the viewer alive until the window closes."""
+    from PySide6.QtWidgets import QApplication
+
+    asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
+    _perf_mark(perf, "viewer.async.start")
+
+    holder = _build_and_show_viewer_qt(zarr_uri, channel_axis=channel_axis, perf=perf)
+    _perf_mark(perf, "viewer.async.build_complete")
+
+    app = QApplication.instance()
+    close_event = asyncio.Event()
+    app.aboutToQuit.connect(close_event.set)
+    await close_event.wait()
+    # Keep the holder referenced until the loop ends so the window/controls are
+    # not garbage collected mid-session.
+    del holder
+
+
+class _ViewerHandle:
+    """Keeps strong references to the live viewer objects (prevents GC)."""
+
+    def __init__(self, viewer, window, canvas_view, geometry) -> None:
+        self.viewer = viewer
+        self.window = window
+        self.canvas_view = canvas_view
+        self.geometry = geometry
+        self._perf_objects: tuple | None = None
+
+
+def _build_and_show_viewer_qt(
+    zarr_uri: str,
+    *,
+    channel_axis: int | None = None,
+    perf: StartupPerfTracer | None = None,
+) -> _ViewerHandle:
+    """Build the Qt viewer window, show it, and arm first-frame startup."""
+    # ``render_qt`` / ``_init_view`` are cellier-internal, but oz-viewer keeps
+    # its own QtAsyncio loop (for the fsspec loop + asyncio exception handler +
+    # perf tracer) rather than cellier's blocking ``launch``, so it drives the
+    # same window build and first-frame arming that ``show``/``launch`` do.
+    from cellier.convenience._launch import _init_view
+    from cellier.convenience.layout._qt_renderer import render_qt
+
+    _perf_mark(perf, "viewer.build.start")
+    data_store, geometry = extract_viewer_geometry(
+        zarr_uri, channel_axis=channel_axis, perf=perf
+    )
+    viewer = build_viewer(data_store, geometry, gui="qt")
+    _perf_mark(perf, "viewer.build.model_ready")
+
+    layout, canvas_view = build_viewer_layout(viewer, geometry)
+    window = render_qt(layout, viewer)
+    window.setWindowTitle("OME-Zarr Viewer")
+    _perf_mark(perf, "viewer.build.window_ready")
+
+    handle = _ViewerHandle(viewer, window, canvas_view, geometry)
+    if perf is not None and perf.enabled:
+        _install_paint_tracker(handle, canvas_view, perf)
+
+    window.show()
+    _perf_mark(perf, "viewer.window.show_called")
+    _init_view(viewer, fit="ready")
+    return handle
+
+
+def _install_paint_tracker(
+    handle: _ViewerHandle,
+    canvas_view: object,
+    perf: StartupPerfTracer,
+) -> None:
+    """Record first-paint and a settle timing on the canvas widget."""
+    from PySide6.QtCore import QEvent, QObject, QTimer
+
+    widget = canvas_view.widget
+
+    settled_timer = QTimer()
+    settled_timer.setSingleShot(True)
+    settled_timer.setInterval(300)
+
+    def _on_settled() -> None:
+        _perf_mark(perf, "viewer.canvas.startup_settled", quiet_ms=300)
+        perf.report_rich_table()
+
+    settled_timer.timeout.connect(_on_settled)
+
+    class _PaintTracker(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Paint:
+                _perf_mark(perf, "viewer.canvas.first_paint")
+                settled_timer.start()
+                widget.removeEventFilter(self)
+            return False
+
+    paint_tracker = _PaintTracker()
+    widget.installEventFilter(paint_tracker)
+    handle._perf_objects = (paint_tracker, settled_timer)
+
+
 # ---------------------------------------------------------------------------
-# Shared builder (used by both viewer() and _run_viewer_async())
+# Layer 3: non-blocking entry points (interactive Qt + notebook anywidget)
 # ---------------------------------------------------------------------------
 
 
-def _build_and_show_viewer(
+def viewer(
     zarr_uri: str,
     theme: str = "dark",
     *,
     channel_axis: int | None = None,
-    perf: StartupPerfTracer | None = None,
-) -> OmeZarrViewer:
-    """Build the full viewer from a zarr URI and show the window."""
+) -> _ViewerHandle:
+    """Open a Qt viewer window without blocking (IPython / interactive).
+
+    The Qt event loop must already be running or be startable via IPython's
+    ``enable_gui``.  For scripts use :func:`launch_viewer`; for notebooks use
+    :func:`display_viewer`.
+
+    Returns
+    -------
+    _ViewerHandle
+        Keep a reference to prevent garbage collection.
+    """
     from PySide6.QtWidgets import QApplication
 
     from oz_viewer.theme import apply_theme
 
-    _perf_mark(perf, "viewer.build.start", theme=theme)
+    app = _ensure_qt_app()
+    if app is None:
+        raise RuntimeError(
+            "No Qt event loop is running. "
+            "Use launch_viewer() for scripts, display_viewer() for notebooks, "
+            "or run inside IPython/Jupyter."
+        )
     apply_theme(QApplication.instance(), theme)
-    _perf_mark(perf, "viewer.build.theme_applied")
+    return _build_and_show_viewer_qt(zarr_uri, channel_axis=channel_axis)
 
-    from cellier.controller import CellierController
-    from cellier.gui.qt import QtCanvasWidget
-    from cellier.render import (
-        RenderManagerConfig,
-        SlicingConfig,
-        TemporalAccumulationConfig,
+
+def display_viewer(
+    zarr_uri: str,
+    *,
+    channel_axis: int | None = None,
+    sidecar: bool = False,
+    min_canvas_size: tuple[int, int] | None = None,
+):
+    """Build and present an anywidget viewer in a notebook (Jupyter / marimo).
+
+    The notebook counterpart of :func:`launch_viewer`.  Returns the cellier
+    ``DisplayHandle`` (Jupyter) or the host-native renderable (marimo).
+
+    Parameters
+    ----------
+    zarr_uri : str
+        Path or URI to the OME-Zarr store.
+    channel_axis : int or None, optional
+        Axis index to treat as the channel dimension.  Auto-detected when
+        ``None``.
+    sidecar : bool
+        Present the viewer in a ``jupyterlab-sidecar`` tab instead of below
+        the cell.  Requires the optional ``sidecar`` package (raises
+        ``ImportError`` with an install hint if missing) and the Jupyter host
+        (raises ``RuntimeError`` under marimo, which already tabs its cell
+        output). The returned ``DisplayHandle`` owns the tab -- call
+        ``handle.close()`` before re-running the cell, or the old tab is left
+        open alongside the new one.
+    min_canvas_size : tuple[int, int] or None, optional
+        Minimum CSS pixel size ``(width, height)`` for the canvas. The canvas
+        column won't shrink below this width as the notebook/dock is resized.
+        Defaults to cellier's built-in ``(600, 600)`` when ``None``.
+    """
+    from cellier.convenience import display
+
+    data_store, geometry = extract_viewer_geometry(zarr_uri, channel_axis=channel_axis)
+    v = build_viewer(data_store, geometry, gui="anywidget")
+    layout, _canvas_view = build_viewer_layout(
+        v, geometry, min_canvas_size=min_canvas_size
     )
-
-    viewer_model, geometry = build_viewer_model(
-        zarr_uri, channel_axis=channel_axis, perf=perf
+    return display(
+        v,
+        layout,
+        fit="ready",
+        sidecar=_sidecar_options(sidecar, "OME-Zarr Viewer"),
     )
-    _perf_mark(perf, "viewer.build.model_ready")
-    data_store = next(iter(viewer_model.data.stores.values()))
-
-    controller = CellierController.from_model(
-        viewer_model,
-        render_config=RenderManagerConfig(
-            slicing=SlicingConfig(batch_size=32, render_every=4),
-            temporal=TemporalAccumulationConfig(enabled=False),
-        ),
-        widget_parent=None,
-    )
-    _perf_mark(perf, "viewer.build.controller_ready")
-
-    controller.camera_reslice_enabled = True
-    controller.camera_settle_threshold_s = 0.3
-
-    scene = controller.get_scene_by_name("main")
-    visual_model = next(iter(scene.visuals))
-
-    canvas_id = controller.get_canvas_ids(scene.id)[0]
-    canvas_view = controller.get_canvas_view(canvas_id)
-    canvas_widget = QtCanvasWidget.from_scene_and_canvas(
-        scene, canvas_view, axis_ranges=geometry.axis_ranges
-    )
-    controller.connect_widget(
-        canvas_widget.dims_sliders,
-        subscription_specs=canvas_widget.dims_sliders.subscription_specs(),
-    )
-    _perf_mark(perf, "viewer.build.canvas_widget_ready")
-
-    v = OmeZarrViewer(
-        controller=controller,
-        scene=scene,
-        canvas_widget=canvas_widget,
-        visual_model=visual_model,
-        geometry=geometry,
-        data_store=data_store,
-    )
-
-    # Perf: track time to first paint.
-    if perf is not None and perf.enabled:
-        from PySide6.QtCore import QEvent, QObject, QTimer
-
-        settled_timer = QTimer()
-        settled_timer.setSingleShot(True)
-        settled_timer.setInterval(300)
-
-        def _on_settled() -> None:
-            _perf_mark(perf, "viewer.canvas.startup_settled", quiet_ms=300)
-            perf.report_rich_table()
-
-        settled_timer.timeout.connect(_on_settled)
-
-        class _PaintTracker(QObject):
-            def eventFilter(self, watched, event):
-                if event.type() == QEvent.Type.Paint:
-                    _perf_mark(perf, "viewer.canvas.first_paint")
-                    settled_timer.start()
-                    canvas_widget.widget.removeEventFilter(self)
-                return False
-
-        paint_tracker = _PaintTracker()
-        canvas_widget.widget.installEventFilter(paint_tracker)
-        v._startup_perf_objects = (paint_tracker, settled_timer)
-
-    v.window.show()
-    _perf_mark(perf, "viewer.window.show_called")
-
-    controller.fit_camera(scene.id)
-    controller.reslice_scene(scene.id)
-
-    return v

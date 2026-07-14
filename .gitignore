@@ -73,6 +73,10 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Generated example datasets
+*.ome.zarr/
+cells3d.ome.zarr
+
 # pyenv
 .python-version
 
