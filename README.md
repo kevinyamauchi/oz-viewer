@@ -18,7 +18,16 @@ uv pip install "oz-viewer[examples] @ git+https://github.com/kevinyamauchi/oz-vi
 
 # if you want to try the Jupyter Lab viewer, install rendercanvas from main
 uv pip install git+https://github.com/pygfx/rendercanvas.git 
-````
+```
+
+## Download dataset
+
+You can download an example dataset using the `download` CLI. For example, download the https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr (1937, 2048, 2048) dataset used in the examples below with the following command (~10 GB):
+
+```sh
+oz-viewer download https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr
+```
+
 ## Single canvas viewer
 
 You can load a v0.4 or v0.5 OME-Zarr file into a single-canvas 2d/3d viewer using the `oz-viewer view` CLI. See the example below. Replace the file path with the path to your image. This works for both local and remote data.
