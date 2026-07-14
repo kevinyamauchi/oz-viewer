@@ -6,8 +6,19 @@
 [![CI](https://github.com/kevinyamauchi/oz-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinyamauchi/oz-viewer/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/kevinyamauchi/oz-viewer/branch/main/graph/badge.svg)](https://codecov.io/gh/kevinyamauchi/oz-viewer)
 
+> [!NOTE]
+> This is an early prototype. Many things may not be working and the API will change.
+
 A viewer for ome-zarr images.
 
+## Installation
+
+```sh
+uv pip install "git+https://github.com/kevinyamauchi/oz-viewer.git[examples]"
+
+# if you want to try the Jupyter Lab viewer, install rendercanvas from main
+uv pip install git+https://github.com/pygfx/rendercanvas.git 
+````
 ## Single canvas viewer
 
 You can load a v0.4 or v0.5 OME-Zarr file into a single-canvas 2d/3d viewer using the `oz-viewer view` CLI. See the example below. Replace the file path with the path to your image. This works for both local and remote data.
@@ -32,11 +43,15 @@ Example viewing https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_A
 
 https://github.com/user-attachments/assets/a6c0cab9-0cd9-4fe0-80c2-c77207b4fd77
 
-You can click the multichannel button in the upper left-hand corner to toggle berween single/multichannel rendering. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
+You can click the multichannel button in the upper left-hand corner to toggle between single/multichannel rendering. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
 
 https://github.com/user-attachments/assets/b6655863-b8fb-4eea-be84-eb031283494e
 
+## Jupyter Lab
 
+Both the viewer and orthoviewer can be used in Jupyter Lab. See the `examples/viewer.ipynb` and `examples/orthoviewer.ipynb` notebooks for examples. The viewer can be rendered as a sidecar widget next to the notebook.
+
+https://github.com/user-attachments/assets/f572a57e-ab92-4bf4-8b4c-e6af46c9f6ed
 
 ## Test dataset latency
 
