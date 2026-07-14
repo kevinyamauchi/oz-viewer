@@ -1,0 +1,990 @@
+"""Toolkit-independent 3D overlays for the convenience-based orthoviewer.
+
+The orthoviewer's three 3D overlays -- the volume transparency manager, the
+slice-plane meshes, and the orientation gizmo -- all speak only *controller +
+scene id + visual id + mesh store*, never Qt.  This module holds them (ported
+verbatim from the old hand-built orthoviewer) plus :func:`attach_ortho_overlays`,
+which wires them on top of a :class:`cellier.convenience.OrthoViewer`.
+
+Because everything is model/controller-level, these overlays render in both Qt
+and anywidget with no per-toolkit code (conversion plan section 4).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from cellier.convenience import OrthoViewer
+
+    from oz_viewer.viewer._geometry import _ViewerGeometry
+
+# Colors matching the 2D panel slider gradients (blue=XY, green=XZ, orange=YZ).
+_PLANE_COLOR_XY = (0.33, 0.33, 1.00)  # blue
+_PLANE_COLOR_XZ = (0.23, 0.67, 0.23)  # green
+_PLANE_COLOR_YZ = (0.80, 0.40, 0.00)  # orange
+
+_AXIS_3D_LENGTH_FRACTION: float = 0.12
+_AXIS_3D_CUBE_SIDE_FRACTION: float = 0.024
+_AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
+_AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
+_N_FACES_PER_BOX: int = 12
+
+_TRANSPARENCY_MODES: list[str] = ["weighted_blend", "weighted_solid", "blend", "add"]
+
+_INITIAL_PLANE_OPACITY: float = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Volume transparency profiles
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _VolTransparencyProfile:
+    transparency_mode: str
+    opacity: float
+
+
+_ISO_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 0.3)
+_MIP_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 1.0)
+
+
+@dataclass
+class _VisualRenderProfile:
+    render_order: int
+    depth_test: bool
+    depth_write: bool
+    transparency_mode: str
+    opacity: float
+
+
+_ISO_PLANE_PROFILE = _VisualRenderProfile(
+    render_order=0,
+    depth_test=True,
+    depth_write=True,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+_MIP_PLANE_PROFILE = _VisualRenderProfile(
+    render_order=1,
+    depth_test=False,
+    depth_write=True,
+    transparency_mode="weighted_blend",
+    opacity=0.99,
+)
+_ISO_AXES_PROFILE = _VisualRenderProfile(
+    render_order=1,
+    depth_test=True,
+    depth_write=True,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+_MIP_AXES_PROFILE = _VisualRenderProfile(
+    render_order=2,
+    depth_test=False,
+    depth_write=False,
+    transparency_mode="blend",
+    opacity=1.0,
+)
+
+
+# ---------------------------------------------------------------------------
+# Volume transparency manager
+# ---------------------------------------------------------------------------
+
+
+class _VolTransparencyManager:
+    """Manages transparency profiles for each render mode via the model layer."""
+
+    def __init__(
+        self,
+        controller,
+        vol_visual_id,
+        *,
+        vol_is_multichannel: bool = False,
+        plane_visual_id=None,
+        axis_visual_ids: list | None = None,
+        initial_mode: str = "iso",
+    ) -> None:
+        self._controller = controller
+        self._vol_visual_id = vol_visual_id
+        self._vol_is_multichannel = vol_is_multichannel
+        self._plane_visual_id = plane_visual_id
+        self._axis_visual_ids: list = axis_visual_ids or []
+        self._vol_profiles: dict[str, _VolTransparencyProfile] = {
+            "iso": _VolTransparencyProfile(
+                transparency_mode=_ISO_DEFAULT_TRANSPARENCY.transparency_mode,
+                opacity=_ISO_DEFAULT_TRANSPARENCY.opacity,
+            ),
+            "mip": _VolTransparencyProfile(
+                transparency_mode=_MIP_DEFAULT_TRANSPARENCY.transparency_mode,
+                opacity=_MIP_DEFAULT_TRANSPARENCY.opacity,
+            ),
+        }
+        self._plane_profiles: dict[str, _VisualRenderProfile] = {
+            "iso": _ISO_PLANE_PROFILE,
+            "mip": _MIP_PLANE_PROFILE,
+        }
+        self._axes_profiles: dict[str, _VisualRenderProfile] = {
+            "iso": _ISO_AXES_PROFILE,
+            "mip": _MIP_AXES_PROFILE,
+        }
+        self._current_mode = (
+            initial_mode if initial_mode in self._vol_profiles else "iso"
+        )
+
+    @property
+    def current_mode(self) -> str:
+        return self._current_mode
+
+    @property
+    def current_profile(self) -> _VolTransparencyProfile:
+        return self._vol_profiles[self._current_mode]
+
+    def _apply_profile_to_mesh(self, visual_id, profile: _VisualRenderProfile) -> None:
+        if visual_id is None:
+            return
+        c = self._controller
+        c.update_appearance_field(visual_id, "render_order", profile.render_order)
+        c.update_appearance_field(visual_id, "depth_test", profile.depth_test)
+        c.update_appearance_field(visual_id, "depth_write", profile.depth_write)
+        c.update_appearance_field(
+            visual_id, "transparency_mode", profile.transparency_mode
+        )
+        c.update_appearance_field(visual_id, "opacity", profile.opacity)
+
+    def _apply_vol_profile(self) -> None:
+        """Apply the current volume profile via the model layer.
+
+        For multichannel visuals each ChannelAppearance is mutated directly
+        since they share no single .appearance object; the psygnal bridge then
+        routes the changes to the render layer.  For single-channel visuals
+        update_appearance_field is used so source-id threading is preserved.
+        """
+        vid = self._vol_visual_id
+        if vid is None:
+            return
+        vol = self.current_profile
+        depth_write = vol.transparency_mode == "weighted_solid"
+        if self._vol_is_multichannel:
+            visual = self._controller.get_visual_model(vid)
+            for ch in visual.channels.values():
+                ch.transparency_mode = vol.transparency_mode
+                ch.opacity = vol.opacity
+        else:
+            c = self._controller
+            c.update_appearance_field(vid, "transparency_mode", vol.transparency_mode)
+            c.update_appearance_field(vid, "opacity", vol.opacity)
+            c.update_appearance_field(vid, "depth_write", depth_write)
+
+    def apply(self) -> None:
+        self._apply_vol_profile()
+        plane_profile = self._plane_profiles[self._current_mode]
+        self._apply_profile_to_mesh(self._plane_visual_id, plane_profile)
+        axes_profile = self._axes_profiles[self._current_mode]
+        for vid in self._axis_visual_ids:
+            self._apply_profile_to_mesh(vid, axes_profile)
+
+    def on_render_mode_changed(self, new_mode: str) -> None:
+        if new_mode in self._vol_profiles:
+            self._current_mode = new_mode
+        elif new_mode.startswith("mip"):
+            self._current_mode = "mip"
+        else:
+            self._current_mode = "iso"
+        self.apply()
+
+    def update_transparency_mode(self, transparency_mode: str) -> None:
+        self.current_profile.transparency_mode = transparency_mode
+        self.apply()
+
+    def update_opacity(self, opacity: float) -> None:
+        self.current_profile.opacity = opacity
+        self.apply()
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers (pure numpy + MeshMemoryStore, no Qt, no viewer coupling)
+# ---------------------------------------------------------------------------
+
+
+def _box_faces_geometry(
+    centre_zyx: np.ndarray,
+    half_extents_zyx: np.ndarray,
+    vertex_offset: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cz, cy, cx = float(centre_zyx[0]), float(centre_zyx[1]), float(centre_zyx[2])
+    hz, hy, hx = (
+        float(half_extents_zyx[0]),
+        float(half_extents_zyx[1]),
+        float(half_extents_zyx[2]),
+    )
+    z0, z1 = cz - hz, cz + hz
+    y0, y1 = cy - hy, cy + hy
+    x0, x1 = cx - hx, cx + hx
+
+    positions = np.array(
+        [
+            [z0, y0, x0],
+            [z0, y1, x0],
+            [z0, y1, x1],
+            [z0, y0, x1],  # Face 0: -Z
+            [z1, y0, x0],
+            [z1, y0, x1],
+            [z1, y1, x1],
+            [z1, y1, x0],  # Face 1: +Z
+            [z0, y0, x0],
+            [z0, y0, x1],
+            [z1, y0, x1],
+            [z1, y0, x0],  # Face 2: -Y
+            [z0, y1, x0],
+            [z1, y1, x0],
+            [z1, y1, x1],
+            [z0, y1, x1],  # Face 3: +Y
+            [z0, y0, x0],
+            [z1, y0, x0],
+            [z1, y1, x0],
+            [z0, y1, x0],  # Face 4: -X
+            [z0, y0, x1],
+            [z0, y1, x1],
+            [z1, y1, x1],
+            [z1, y0, x1],  # Face 5: +X
+        ],
+        dtype=np.float32,
+    )
+
+    base_indices = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 5, 6],
+            [4, 6, 7],
+            [8, 9, 10],
+            [8, 10, 11],
+            [12, 13, 14],
+            [12, 14, 15],
+            [16, 17, 18],
+            [16, 18, 19],
+            [20, 21, 22],
+            [20, 22, 23],
+        ],
+        dtype=np.int32,
+    )
+    return positions, base_indices + vertex_offset
+
+
+def _make_axis_set_geometry(
+    axis_a: int,
+    axis_b: int,
+    axis_length: float,
+    cube_side: float,
+    prism_cross_section: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    half_cube = cube_side / 2.0
+    half_length = axis_length / 2.0
+    half_cross = prism_cross_section / 2.0
+
+    origin = np.zeros(3, dtype=np.float64)
+    cube_half_extents = np.full(3, half_cube, dtype=np.float64)
+    cube_positions, cube_indices = _box_faces_geometry(origin, cube_half_extents, 0)
+
+    centre_a = np.zeros(3, dtype=np.float64)
+    centre_a[axis_a] = half_cube + half_length
+    half_extents_a = np.full(3, half_cross, dtype=np.float64)
+    half_extents_a[axis_a] = half_length
+    prism_a_positions, prism_a_indices = _box_faces_geometry(
+        centre_a, half_extents_a, 24
+    )
+
+    centre_b = np.zeros(3, dtype=np.float64)
+    centre_b[axis_b] = half_cube + half_length
+    half_extents_b = np.full(3, half_cross, dtype=np.float64)
+    half_extents_b[axis_b] = half_length
+    prism_b_positions, prism_b_indices = _box_faces_geometry(
+        centre_b, half_extents_b, 48
+    )
+
+    positions = np.concatenate([cube_positions, prism_a_positions, prism_b_positions])
+    indices = np.concatenate([cube_indices, prism_a_indices, prism_b_indices])
+    return positions, indices
+
+
+def _make_axis_set_face_colors(
+    axis_a_color_rgb: tuple[float, float, float],
+    axis_b_color_rgb: tuple[float, float, float],
+) -> np.ndarray:
+    cube_color = np.array(_AXIS_3D_CUBE_COLOUR, dtype=np.float32)
+    color_a = np.array([*axis_a_color_rgb, 1.0], dtype=np.float32)
+    color_b = np.array([*axis_b_color_rgb, 1.0], dtype=np.float32)
+    return np.concatenate(
+        [
+            np.tile(cube_color, (_N_FACES_PER_BOX, 1)),
+            np.tile(color_a, (_N_FACES_PER_BOX, 1)),
+            np.tile(color_b, (_N_FACES_PER_BOX, 1)),
+        ]
+    )
+
+
+def _pad_positions(
+    positions_3d: np.ndarray,
+    spatial_axes: tuple[int, int, int],
+    n_dims: int,
+) -> np.ndarray:
+    """Scatter 3-D local ZYX positions into an N-dim global positions array.
+
+    The three local columns (0=Z, 1=Y, 2=X) are placed at the global axis
+    indices given by ``spatial_axes``.  All other columns remain zero.
+    """
+    if n_dims == 3 and spatial_axes == (0, 1, 2):
+        return positions_3d
+    out = np.zeros((len(positions_3d), n_dims), dtype=positions_3d.dtype)
+    out[:, spatial_axes[0]] = positions_3d[:, 0]
+    out[:, spatial_axes[1]] = positions_3d[:, 1]
+    out[:, spatial_axes[2]] = positions_3d[:, 2]
+    return out
+
+
+def _spatial_translation(
+    z: float,
+    y: float,
+    x: float,
+    spatial_axes: tuple[int, int, int],
+    n_dims: int,
+) -> tuple[float, ...]:
+    """Build an N-dim translation vector with spatial values at global axis indices."""
+    t = np.zeros(n_dims, dtype=np.float64)
+    t[spatial_axes[0]] = z
+    t[spatial_axes[1]] = y
+    t[spatial_axes[2]] = x
+    return tuple(float(v) for v in t)
+
+
+def _make_axis_meshes(
+    controller,
+    vol_scene,
+    initial_centre_zyx: np.ndarray,
+    world_min_extent: float,
+    *,
+    spatial_axes: tuple[int, int, int],
+    n_dims: int,
+) -> tuple:
+    from cellier.data.mesh import MeshMemoryStore
+    from cellier.transform import AffineTransform
+    from cellier.visuals import MeshFlatAppearance
+
+    color_z = _PLANE_COLOR_XY
+    color_y = _PLANE_COLOR_XZ
+    color_x = _PLANE_COLOR_YZ
+
+    view_specifications = [
+        ("xy_axis_set", 1, 2, color_y, color_x),
+        ("xz_axis_set", 0, 2, color_z, color_x),
+        ("yz_axis_set", 0, 1, color_z, color_y),
+    ]
+
+    axis_length = _AXIS_3D_LENGTH_FRACTION * world_min_extent
+    cube_side = _AXIS_3D_CUBE_SIDE_FRACTION * world_min_extent
+    prism_cross_section = _AXIS_3D_PRISM_CROSS_SECTION_FRACTION * world_min_extent
+
+    initial_translation = _spatial_translation(
+        float(initial_centre_zyx[0]),
+        float(initial_centre_zyx[1]),
+        float(initial_centre_zyx[2]),
+        spatial_axes,
+        n_dims,
+    )
+    initial_transform = AffineTransform.from_translation(initial_translation)
+
+    axis_stores = []
+    axis_visuals = []
+    for view_name, axis_a, axis_b, color_a, color_b in view_specifications:
+        positions_3d, indices = _make_axis_set_geometry(
+            axis_a, axis_b, axis_length, cube_side, prism_cross_section
+        )
+        positions = _pad_positions(positions_3d, spatial_axes, n_dims)
+        face_colors = _make_axis_set_face_colors(color_a, color_b)
+        store = MeshMemoryStore(
+            positions=positions, indices=indices, colors=face_colors, name=view_name
+        )
+        appearance = MeshFlatAppearance(
+            color_mode="face",
+            side="both",
+            opacity=1.0,
+            render_order=1,
+            depth_test=True,
+            depth_write=True,
+            depth_compare="<=",
+            transparency_mode="blend",
+        )
+        visual = controller.add_mesh(
+            data=store,
+            scene_id=vol_scene.id,
+            appearance=appearance,
+            name=view_name,
+            transform=initial_transform,
+        )
+        axis_stores.append(store)
+        axis_visuals.append(visual)
+
+    return tuple(axis_visuals), tuple(axis_stores)
+
+
+def _make_plane_positions(
+    z_world: float,
+    y_world: float,
+    x_world: float,
+    world_max_zyx: np.ndarray,
+    *,
+    spatial_axes: tuple[int, int, int] = (0, 1, 2),
+    n_dims: int = 3,
+) -> np.ndarray:
+    wz = float(world_max_zyx[0])
+    wy = float(world_max_zyx[1])
+    wx = float(world_max_zyx[2])
+    z, y, x = float(z_world), float(y_world), float(x_world)
+    sz0, sz1, sz2 = spatial_axes
+
+    positions = np.zeros((12, n_dims), dtype=np.float32)
+
+    # XY plane (constant Z = z)
+    positions[0:4, sz0] = z
+    positions[0:4, sz1] = [0.0, wy, wy, 0.0]
+    positions[0:4, sz2] = [0.0, 0.0, wx, wx]
+
+    # XZ plane (constant Y = y)
+    positions[4:8, sz0] = [0.0, wz, wz, 0.0]
+    positions[4:8, sz1] = y
+    positions[4:8, sz2] = [0.0, 0.0, wx, wx]
+
+    # YZ plane (constant X = x)
+    positions[8:12, sz0] = [0.0, wz, wz, 0.0]
+    positions[8:12, sz1] = [0.0, 0.0, wy, wy]
+    positions[8:12, sz2] = x
+
+    return positions
+
+
+def _make_plane_colors(opacity: float) -> np.ndarray:
+    a = float(opacity)
+    return np.array(
+        [
+            [*_PLANE_COLOR_XY, a],
+            [*_PLANE_COLOR_XY, a],
+            [*_PLANE_COLOR_XZ, a],
+            [*_PLANE_COLOR_XZ, a],
+            [*_PLANE_COLOR_YZ, a],
+            [*_PLANE_COLOR_YZ, a],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _make_plane_mesh(
+    controller,
+    vol_scene,
+    z_world: float,
+    y_world: float,
+    x_world: float,
+    world_max_zyx: np.ndarray,
+    initial_opacity: float = 0.4,
+    *,
+    spatial_axes: tuple[int, int, int] = (0, 1, 2),
+    n_dims: int = 3,
+):
+    from cellier.data.mesh import MeshMemoryStore
+    from cellier.visuals import MeshFlatAppearance
+
+    positions = _make_plane_positions(
+        z_world,
+        y_world,
+        x_world,
+        world_max_zyx,
+        spatial_axes=spatial_axes,
+        n_dims=n_dims,
+    )
+    colors = _make_plane_colors(initial_opacity)
+    indices = np.array(
+        [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11]],
+        dtype=np.int32,
+    )
+
+    store = MeshMemoryStore(
+        positions=positions, indices=indices, colors=colors, name="slice_planes"
+    )
+    appearance = MeshFlatAppearance(
+        color_mode="face", side="both", opacity=initial_opacity, wireframe=False
+    )
+    visual = controller.add_mesh(
+        data=store, scene_id=vol_scene.id, appearance=appearance, name="slice_planes"
+    )
+    return store, visual
+
+
+class _PlaneUpdater:
+    def __init__(
+        self,
+        controller,
+        plane_store,
+        plane_visual,
+        world_max_zyx,
+        *,
+        spatial_axes: tuple[int, int, int] = (0, 1, 2),
+        n_dims: int = 3,
+        channel_axis: int | None = None,
+    ) -> None:
+        self._id = uuid4()
+        self._controller = controller
+        self._plane_store = plane_store
+        self._plane_visual = plane_visual
+        self._world_max_zyx = world_max_zyx
+        self._spatial_axes = spatial_axes
+        self._n_dims = n_dims
+        self._channel_axis = channel_axis
+        self._ch_world: float = 0.0
+
+        # Read initial slice positions from the N-dim positions array.
+        positions = plane_store.positions
+        sz0, sz1, sz2 = spatial_axes
+        self._z_world = float(positions[0, sz0])  # XY plane vertex 0: Z
+        self._y_world = float(positions[4, sz1])  # XZ plane vertex 4: Y
+        self._x_world = float(positions[8, sz2])  # YZ plane vertex 8: X
+
+    def _update(self) -> None:
+        positions = _make_plane_positions(
+            self._z_world,
+            self._y_world,
+            self._x_world,
+            self._world_max_zyx,
+            spatial_axes=self._spatial_axes,
+            n_dims=self._n_dims,
+        )
+        if self._channel_axis is not None:
+            positions[:, self._channel_axis] = self._ch_world
+        self._plane_store.positions = positions
+        self._controller.reslice_visual(self._plane_visual.id)
+
+    def on_channel_changed(self, new_ch: int) -> None:
+        self._ch_world = float(new_ch)
+        # Only update the store positions; reslice_scene (triggered by
+        # update_slice_indices on the vol scene) handles the actual reslice with
+        # the correct channel dims, avoiding a conflicting reslice with stale dims.
+        positions = _make_plane_positions(
+            self._z_world,
+            self._y_world,
+            self._x_world,
+            self._world_max_zyx,
+            spatial_axes=self._spatial_axes,
+            n_dims=self._n_dims,
+        )
+        if self._channel_axis is not None:
+            positions[:, self._channel_axis] = self._ch_world
+        self._plane_store.positions = positions
+
+    def on_xy_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz0 = self._spatial_axes[0]
+        if sz0 in slice_indices:
+            self._z_world = float(slice_indices[sz0])
+            self._update()
+
+    def on_xz_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz1 = self._spatial_axes[1]
+        if sz1 in slice_indices:
+            self._y_world = float(slice_indices[sz1])
+            self._update()
+
+    def on_yz_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz2 = self._spatial_axes[2]
+        if sz2 in slice_indices:
+            self._x_world = float(slice_indices[sz2])
+            self._update()
+
+
+class _OrientationUpdater:
+    def __init__(
+        self,
+        controller,
+        xy_axis_visual,
+        xz_axis_visual,
+        yz_axis_visual,
+        world_max_zyx: np.ndarray,
+        *,
+        xy_axis_store=None,
+        xz_axis_store=None,
+        yz_axis_store=None,
+        spatial_axes: tuple[int, int, int] = (0, 1, 2),
+        n_dims: int = 3,
+        channel_axis: int | None = None,
+    ):
+        self._id = uuid4()
+        self._controller = controller
+        self._xy_axis_visual_id = xy_axis_visual.id
+        self._xz_axis_visual_id = xz_axis_visual.id
+        self._yz_axis_visual_id = yz_axis_visual.id
+        self._xy_axis_store = xy_axis_store
+        self._xz_axis_store = xz_axis_store
+        self._yz_axis_store = yz_axis_store
+        self._spatial_axes = spatial_axes
+        self._n_dims = n_dims
+        self._channel_axis = channel_axis
+        self._ch_world: float = 0.0
+
+        mid = world_max_zyx / 2.0
+        self._z_world = float(mid[0])
+        self._y_world = float(mid[1])
+        self._x_world = float(mid[2])
+        # N-dim centre vectors, one per 2D panel.
+        self._xy_centre = self._make_centre(self._z_world, self._y_world, self._x_world)
+        self._xz_centre = self._xy_centre.copy()
+        self._yz_centre = self._xy_centre.copy()
+
+    def _make_centre(self, z: float, y: float, x: float) -> np.ndarray:
+        c = np.zeros(self._n_dims, dtype=np.float64)
+        c[self._spatial_axes[0]] = z
+        c[self._spatial_axes[1]] = y
+        c[self._spatial_axes[2]] = x
+        if self._channel_axis is not None:
+            c[self._channel_axis] = self._ch_world
+        return c
+
+    def on_channel_changed(self, new_ch: int) -> None:
+        self._ch_world = float(new_ch)
+        if self._channel_axis is not None:
+            self._xy_centre[self._channel_axis] = self._ch_world
+            self._xz_centre[self._channel_axis] = self._ch_world
+            self._yz_centre[self._channel_axis] = self._ch_world
+            # Update channel column in each axis store so the slab filter keeps
+            # the meshes visible. reslice_scene (from update_slice_indices on the
+            # vol scene) handles the actual reslice — no reslice_visual here.
+            for store in (
+                self._xy_axis_store,
+                self._xz_axis_store,
+                self._yz_axis_store,
+            ):
+                if store is not None:
+                    positions = store.positions.copy()
+                    positions[:, self._channel_axis] = self._ch_world
+                    store.positions = positions
+        self._update_3d()
+
+    def _update_3d(self) -> None:
+        from cellier.transform import AffineTransform
+
+        for visual_id, centre_nd in zip(
+            (self._xy_axis_visual_id, self._xz_axis_visual_id, self._yz_axis_visual_id),
+            (self._xy_centre, self._xz_centre, self._yz_centre),
+            strict=False,
+        ):
+            self._controller.set_visual_transform(
+                visual_id,
+                AffineTransform.from_translation(tuple(float(v) for v in centre_nd)),
+                reslice=False,
+            )
+
+    def on_xy_camera_changed(self, event) -> None:
+        p = event.camera_state.position
+        # p[0] → X world, p[1] → Y world (canvas horizontal/vertical convention)
+        self._xy_centre = self._make_centre(self._z_world, p[1], p[0])
+        self._update_3d()
+
+    def on_xz_camera_changed(self, event) -> None:
+        p = event.camera_state.position
+        # p[0] → X world, p[1] → Z world
+        self._xz_centre = self._make_centre(p[1], self._y_world, p[0])
+        self._update_3d()
+
+    def on_yz_camera_changed(self, event) -> None:
+        p = event.camera_state.position
+        # p[0] → Y world, p[1] → Z world
+        self._yz_centre = self._make_centre(p[1], p[0], self._x_world)
+        self._update_3d()
+
+    def on_xy_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz0 = self._spatial_axes[0]
+        if sz0 in slice_indices:
+            self._z_world = float(slice_indices[sz0])
+            self._xy_centre[sz0] = self._z_world
+        self._update_3d()
+
+    def on_xz_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz1 = self._spatial_axes[1]
+        if sz1 in slice_indices:
+            self._y_world = float(slice_indices[sz1])
+            self._xz_centre[sz1] = self._y_world
+        self._update_3d()
+
+    def on_yz_dims_changed(self, event) -> None:
+        slice_indices = event.dims_state.selection.slice_indices
+        sz2 = self._spatial_axes[2]
+        if sz2 in slice_indices:
+            self._x_world = float(slice_indices[sz2])
+            self._yz_centre[sz2] = self._x_world
+        self._update_3d()
+
+
+# ---------------------------------------------------------------------------
+# Overlay attachment on top of a convenience OrthoViewer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrthoOverlays:
+    """Live handle bundling the orthoviewer's 3D overlays.
+
+    Returned by :func:`attach_ortho_overlays`.  The launcher keeps a reference
+    so the meshes/updaters are not garbage collected; :meth:`close`
+    unsubscribes every owner from the controller bus.
+    """
+
+    transparency_manager: _VolTransparencyManager
+    plane_visual: object
+    plane_store: object
+    axis_visual_ids: list
+    _plane_updater: _PlaneUpdater
+    _orientation_updater: _OrientationUpdater
+    _owner_ids: list
+    _controller: object
+    _render_mode_callback: object | None = None
+    _vol_appearance_events: object | None = None
+
+    def close(self) -> None:
+        """Unsubscribe every overlay owner and detach the render-mode observer."""
+        if (
+            self._render_mode_callback is not None
+            and self._vol_appearance_events is not None
+        ):
+            try:
+                self._vol_appearance_events.render_mode.disconnect(
+                    self._render_mode_callback
+                )
+            except (ValueError, RuntimeError):
+                pass
+        for owner_id in self._owner_ids:
+            self._controller.unsubscribe_owner(owner_id)
+
+
+def attach_ortho_overlays(
+    viewer: OrthoViewer,
+    geometry: _ViewerGeometry,
+    *,
+    vol_visual_id,
+    vol_is_multichannel: bool,
+) -> OrthoOverlays:
+    """Attach the slice-plane, orientation, and transparency overlays.
+
+    Builds the plane + orientation-gizmo meshes in the ``vol`` scene only,
+    wires the updaters to the 2D panels' dims/camera events, and installs the
+    volume transparency manager.  Everything is model/controller-level, so the
+    overlays render identically under Qt and anywidget.
+
+    Parameters
+    ----------
+    viewer : cellier.convenience.OrthoViewer
+        The orthoviewer whose ``controller`` and ``scenes`` drive the overlays.
+    geometry : _ViewerGeometry
+        OME-Zarr geometry (spatial axes, world extents, channel axis).
+    vol_visual_id :
+        The image visual id in the ``vol`` scene the transparency manager owns.
+    vol_is_multichannel : bool
+        Whether the ``vol`` visual is a multichannel visual (locks the
+        transparency manager to MIP and mutates each ``ChannelAppearance``).
+
+    Returns
+    -------
+    OrthoOverlays
+    """
+    controller = viewer.controller
+    scenes = viewer.scenes
+    vol_scene = scenes["vol"]
+
+    spatial_axes = geometry.spatial_axes
+    n_dims_world = len(geometry.axis_names)
+    channel_axis = geometry.channel_axis
+    world_max_zyx = geometry.world_max_spatial
+
+    center = geometry.center_slice_indices()
+    z_mid = center[spatial_axes[0]]
+    y_mid = center[spatial_axes[1]]
+    x_mid = center[spatial_axes[2]]
+    initial_centre_zyx = np.array([z_mid, y_mid, x_mid], dtype=np.float64)
+
+    # --- orientation-gizmo axis meshes (vol scene only) ---
+    (
+        (xy_axis_visual, xz_axis_visual, yz_axis_visual),
+        (xy_axis_store, xz_axis_store, yz_axis_store),
+    ) = _make_axis_meshes(
+        controller=controller,
+        vol_scene=vol_scene,
+        initial_centre_zyx=initial_centre_zyx,
+        world_min_extent=float(world_max_zyx.min()),
+        spatial_axes=spatial_axes,
+        n_dims=n_dims_world,
+    )
+    axis_visual_ids = [xy_axis_visual.id, xz_axis_visual.id, yz_axis_visual.id]
+
+    # --- slice-plane mesh (vol scene only) ---
+    plane_store, plane_visual = _make_plane_mesh(
+        controller,
+        vol_scene,
+        z_mid,
+        y_mid,
+        x_mid,
+        world_max_zyx,
+        initial_opacity=_INITIAL_PLANE_OPACITY,
+        spatial_axes=spatial_axes,
+        n_dims=n_dims_world,
+    )
+
+    plane_updater = _PlaneUpdater(
+        controller=controller,
+        plane_store=plane_store,
+        plane_visual=plane_visual,
+        world_max_zyx=world_max_zyx,
+        spatial_axes=spatial_axes,
+        n_dims=n_dims_world,
+        channel_axis=channel_axis,
+    )
+    controller.on_dims_changed(
+        scenes["xy"].id, plane_updater.on_xy_dims_changed, owner_id=plane_updater._id
+    )
+    controller.on_dims_changed(
+        scenes["xz"].id, plane_updater.on_xz_dims_changed, owner_id=plane_updater._id
+    )
+    controller.on_dims_changed(
+        scenes["yz"].id, plane_updater.on_yz_dims_changed, owner_id=plane_updater._id
+    )
+
+    # --- volume transparency manager ---
+    transparency_manager = _VolTransparencyManager(
+        controller,
+        vol_visual_id,
+        vol_is_multichannel=vol_is_multichannel,
+        plane_visual_id=plane_visual.id,
+        axis_visual_ids=axis_visual_ids,
+        initial_mode="mip" if vol_is_multichannel else "iso",
+    )
+
+    render_mode_callback = None
+    vol_appearance_events = None
+    if not vol_is_multichannel:
+        # Observe the evented appearance model directly so the transparency
+        # profile tracks render_mode changes from any origin (Qt, anywidget,
+        # programmatic) with no widget-signal plumbing (conversion plan D4.4).
+        vol_visual = controller.get_visual_model(vol_visual_id)
+        vol_appearance_events = vol_visual.appearance.events
+
+        def render_mode_callback(new_mode) -> None:
+            transparency_manager.on_render_mode_changed(str(new_mode))
+
+        vol_appearance_events.render_mode.connect(render_mode_callback)
+    transparency_manager.apply()
+
+    # --- orientation updater (camera + dims driven) ---
+    orient_updater = _OrientationUpdater(
+        controller=controller,
+        xy_axis_visual=xy_axis_visual,
+        xz_axis_visual=xz_axis_visual,
+        yz_axis_visual=yz_axis_visual,
+        xy_axis_store=xy_axis_store,
+        xz_axis_store=xz_axis_store,
+        yz_axis_store=yz_axis_store,
+        world_max_zyx=world_max_zyx,
+        spatial_axes=spatial_axes,
+        n_dims=n_dims_world,
+        channel_axis=channel_axis,
+    )
+    orient_owner = orient_updater._id
+    controller.on_camera_changed(
+        scenes["xy"].id, orient_updater.on_xy_camera_changed, owner_id=orient_owner
+    )
+    controller.on_camera_changed(
+        scenes["xz"].id, orient_updater.on_xz_camera_changed, owner_id=orient_owner
+    )
+    controller.on_camera_changed(
+        scenes["yz"].id, orient_updater.on_yz_camera_changed, owner_id=orient_owner
+    )
+    controller.on_dims_changed(
+        scenes["xy"].id, orient_updater.on_xy_dims_changed, owner_id=orient_updater._id
+    )
+    controller.on_dims_changed(
+        scenes["xz"].id, orient_updater.on_xz_dims_changed, owner_id=orient_updater._id
+    )
+    controller.on_dims_changed(
+        scenes["yz"].id, orient_updater.on_yz_dims_changed, owner_id=orient_updater._id
+    )
+
+    owner_ids = [plane_updater._id, orient_updater._id]
+
+    # --- channel following (replaces the old _ChannelAxisSyncer) ---
+    # In single-channel mode the channel axis is a normal (synced) extra axis;
+    # the overlays must track it.  The convenience OrthoViewer's built-in
+    # _ExtraAxisSyncer keeps the channel in step across panels, so a thin bridge
+    # on the vol scene forwards the new channel to the updaters (conversion plan
+    # D4.5).  In multichannel mode the channel axis is stacked (no slider, never
+    # changes) so no bridge is needed.
+    if channel_axis is not None and not vol_is_multichannel:
+        bridge_owner = uuid4()
+
+        def _on_channel_bridge(event) -> None:
+            slice_indices = event.dims_state.selection.slice_indices
+            if channel_axis not in slice_indices:
+                return
+            new_ch = int(slice_indices[channel_axis])
+            plane_updater.on_channel_changed(new_ch)
+            controller.reslice_visual(plane_visual.id)
+            orient_updater.on_channel_changed(new_ch)
+            for vid in axis_visual_ids:
+                controller.reslice_visual(vid)
+
+        controller.on_dims_changed(
+            vol_scene.id, _on_channel_bridge, owner_id=bridge_owner
+        )
+        owner_ids.append(bridge_owner)
+
+    # --- seed the orientation gizmo from post-fit camera state ---
+    # The initial camera fit is deferred to the canvas first frame (fit="ready"),
+    # so seed once every panel is ready rather than synchronously at build time.
+    def _seed_cameras() -> None:
+        from cellier.events import CameraChangedEvent
+
+        for key, handler in (
+            ("xy", orient_updater.on_xy_camera_changed),
+            ("xz", orient_updater.on_xz_camera_changed),
+            ("yz", orient_updater.on_yz_camera_changed),
+        ):
+            scene_id = scenes[key].id
+            canvas_ids = controller.get_canvas_ids(scene_id)
+            if not canvas_ids:
+                continue
+            canvas_view = controller.get_canvas_view(canvas_ids[0])
+            handler(
+                CameraChangedEvent(
+                    source_id=canvas_view.canvas_id,
+                    scene_id=scene_id,
+                    camera_state=canvas_view.capture_camera_state(),
+                )
+            )
+
+    viewer.on_ready(_seed_cameras)
+
+    return OrthoOverlays(
+        transparency_manager=transparency_manager,
+        plane_visual=plane_visual,
+        plane_store=plane_store,
+        axis_visual_ids=axis_visual_ids,
+        _plane_updater=plane_updater,
+        _orientation_updater=orient_updater,
+        _owner_ids=owner_ids,
+        _controller=controller,
+        _render_mode_callback=render_mode_callback,
+        _vol_appearance_events=vol_appearance_events,
+    )

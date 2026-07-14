@@ -15,7 +15,7 @@ _N_BLOBS = 12
 _BLOB_RADIUS_UM = 120.0
 _CHUNK_ZYX = (32, 32, 32)
 
-_DEFAULT_PATH = Path(__file__).parent / "example_anisotropic_blobs.ome.zarr"
+_DEFAULT_PATH = Path("example_anisotropic_blobs.ome.zarr")
 
 
 def _make_blob_volume(
@@ -62,7 +62,7 @@ def _make_blob_volume(
     return volume
 
 
-def make_example_zarr(output_path: Path = _DEFAULT_PATH) -> Path:
+def make_example_zarr(output_path: Path | str = _DEFAULT_PATH) -> Path:
     """Create a synthetic anisotropic OME-Zarr with spherical blobs.
 
     Uses the same Z/YX scale ratio as ExpA (5.0 : 6.55 µm). Only Y and X are
@@ -71,8 +71,11 @@ def make_example_zarr(output_path: Path = _DEFAULT_PATH) -> Path:
 
     Parameters
     ----------
-    output_path : Path
-        Directory to write the OME-Zarr store. Created if absent.
+    output_path : Path or str
+        Directory to write the OME-Zarr store. Defaults to
+        ``example_anisotropic_blobs.ome.zarr`` in the current working
+        directory. If the path already exists it is left untouched and
+        returned.
 
     Returns
     -------
