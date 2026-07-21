@@ -14,9 +14,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-pytest.importorskip("PySide6")
-pytest.importorskip("cellier.convenience")
-
 
 @pytest.fixture(scope="module")
 def qapp():

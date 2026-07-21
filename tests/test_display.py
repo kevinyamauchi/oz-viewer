@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("cellier.convenience")
-
 
 def test_sidecar_options_false_returns_none():
     from oz_viewer.viewer._utils import _sidecar_options
