@@ -2,8 +2,9 @@
 
 Rebuilt on top of :mod:`cellier.convenience`, so the same builder runs under
 both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter / marimo).
-The 2D/3D toggle, appearance controls, and per-channel controls are provided by
-cellier's cross-toolkit ``Layout`` docks; this module only supplies the
+Appearance controls and per-channel controls are provided by cellier's
+cross-toolkit ``Layout`` docks and the 2D/3D toggle by the dims control
+embedded in the canvas view; this module only supplies the
 OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and the
 Qt-specific launch niceties oz-viewer cares about (theme, fsspec loop, asyncio
 exception handling, startup perf tracing).
@@ -234,12 +235,7 @@ def build_viewer_layout(
         The layout spec plus the canvas view/widget (kept by the caller so it
         can install a paint tracker or avoid GC).
     """
-    from cellier.convenience import (
-        AppearanceControls,
-        ChannelControls,
-        Layout,
-        SceneControls,
-    )
+    from cellier.convenience import AppearanceControls, ChannelControls, Layout
     from cellier.convenience.gui import build_canvas_widget
 
     canvas_view = build_canvas_widget(
@@ -250,18 +246,14 @@ def build_viewer_layout(
     )
 
     # Left dock: per-channel controls for multichannel data, otherwise the
-    # single-channel appearance panel.  Bottom dock: 2D/3D toggle (needs >=3
-    # spatial axes to be meaningful).
+    # single-channel appearance panel.  The 2D/3D toggle needs no dock of its
+    # own -- cellier embeds it in the canvas view's dims control.
     if geometry.channel_axis is not None:
         left: object = ChannelControls()
     else:
         left = AppearanceControls()
 
-    docks: dict[str, object] = {"left_dock": left}
-    if geometry.spatial_ndim >= 3:
-        docks["bottom_dock"] = SceneControls()
-
-    layout = Layout(center=canvas_view, **docks)
+    layout = Layout(center=canvas_view, left_dock=left)
     return layout, canvas_view
 
 
