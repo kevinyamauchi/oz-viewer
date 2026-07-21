@@ -38,7 +38,7 @@ dependencies = [
     "typer >= 0.12",
     "rich >= 13",
     "numpy >= 1.24",
-    "cellier[pyside,anywidget]>=0.0.25",
+    "cellier[pyside,anywidget]>=0.0.26",
     "aiohttp >= 3.9",
     "zarr >= 3.0",
     "s3fs",

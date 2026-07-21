@@ -15,9 +15,6 @@ A viewer for ome-zarr images.
 
 ```sh
 uv pip install "oz-viewer[examples] @ git+https://github.com/kevinyamauchi/oz-viewer.git"
-
-# if you want to try the Jupyter Lab viewer, install rendercanvas from main
-uv pip install git+https://github.com/pygfx/rendercanvas.git 
 ```
 
 ## Download dataset
